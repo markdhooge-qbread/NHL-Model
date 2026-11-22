@@ -108,6 +108,14 @@ def load_boxscore(game_id):
     return resp.json()
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def load_scores(date_str):
+    """Live scoreboard for a date: state, score, SOG, period and clock for every game, keyed by game id."""
+    resp = requests.get(f"{NHL_API}/score/{date_str}", timeout=15)
+    resp.raise_for_status()
+    return {g["id"]: g for g in resp.json().get("games", [])}
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_roster(abbr):
     """Current NHL roster skater ids for a team, or None if unavailable."""
@@ -245,6 +253,7 @@ def games_on(sched, date_str):
                 "home": g["homeTeam"]["abbrev"],
                 "state": g.get("gameState", "FUT"),
                 "time": start.strftime("%-I:%M %p ET"),
+                "start": start,
             })
     return games
 
@@ -668,8 +677,9 @@ with st.expander("🥅 Goalie overrides"):
 
 # Box scores for games at or past warmups: confirmed starting goalies and dressed lineups.
 boxes = {}
+_soon = datetime.datetime.now(EST) + datetime.timedelta(minutes=45)
 for g in games:
-    if g["state"] != "FUT":
+    if g["state"] != "FUT" or g["start"] <= _soon:
         try:
             boxes[g["id"]] = load_boxscore(g["id"])
         except Exception:  # noqa: BLE001
@@ -806,28 +816,59 @@ with tab_props:
         st.error(f"Could not project {aa} @ {ha}: {exc}")
 
 with tab_live:
-    any_live = any(g["state"] in LIVE_STATES for g in games)
+    now_et = datetime.datetime.now(EST)
+
+    def has_started(g, state):
+        return state not in ("FUT", "PRE") or g["start"] <= now_et
+
+    # The schedule is cached for 5 minutes, so also treat any game past its start time as possibly live.
+    any_live = any(
+        g["state"] in LIVE_STATES or (g["state"] not in FINAL_STATES and g["start"] <= now_et) for g in games
+    )
 
     @st.fragment(run_every=60 if any_live else None)
     def live_tracker():
         c1, c2 = st.columns([3, 1])
         c1.caption("Auto-refreshes every 60s while games are live." if any_live else "Projection vs. live/final box score.")
         if c2.button("Refresh", use_container_width=True, key="live_refresh"):
+            load_scores.clear()
             load_boxscore.clear()
 
+        try:
+            scores = load_scores(date_str)
+            score_err = None
+        except Exception as exc:  # noqa: BLE001
+            scores, score_err = {}, exc
+
         # Uses the NHL-confirmed starter when known (no manual overrides) and no player B2B, as in the notebook.
-        entries = []
+        entries, box_errs = [], []
         for g in games:
-            box = None
-            if g["state"] not in ("FUT", "PRE"):
+            live = scores.get(g["id"], {})
+            state = live.get("gameState", g["state"])
+            box = dict(live) if live else None
+            if has_started(g, state):
                 try:
-                    box = load_boxscore(g["id"])
-                except Exception:  # noqa: BLE001
-                    box = None
-            if box:
-                boxes[g["id"]] = box
+                    full = load_boxscore(g["id"])
+                    boxes[g["id"]] = full
+                    box = {**(box or {}), **full}
+                    # The scoreboard updates faster than the box score for state and clock.
+                    for k in ("gameState", "clock", "periodDescriptor"):
+                        if k in live:
+                            box[k] = live[k]
+                    for side in ("awayTeam", "homeTeam"):
+                        live_side = live.get(side, {})
+                        merged = dict(full.get(side, {}))
+                        merged.update({k: live_side[k] for k in ("score", "sog") if k in live_side})
+                        box[side] = merged
+                except Exception as exc:  # noqa: BLE001
+                    box_errs.append(f"{g['away']}@{g['home']}: {exc}")
             entries.append((g, box, game_status(g, box)))
         entries.sort(key=lambda e: (STATUS_ORDER[e[2]["kind"]], games.index(e[0])))
+
+        if score_err and box_errs:
+            st.warning(f"Live data unavailable from the NHL API right now ({score_err}). Showing projections only.")
+        elif box_errs:
+            st.caption("Box score not available yet for " + ", ".join(e.split(":")[0] for e in box_errs) + ".")
 
         for g, box, status in entries:
             aa, ha = g["away"], g["home"]
