@@ -12,9 +12,18 @@ NHL game flow and player prop model, synced from Google Colab.
 
 Each cell is self-contained and pulls fresh data from MoneyPuck (`SEASON = 2026`) and `api-web.nhle.com`.
 
-## Running
+## Streamlit app
 
-Open the notebook in Google Colab and run the cells. To run locally instead, use `pip install -r requirements.txt` and open it in Jupyter.
+`app.py` is a Streamlit version of the notebook, with the same three views as tabs (Slate, Player Props, Backtest). It also has a date picker and a goalie override panel that applies to both the slate and props.
+
+- Run locally: `pip install -r requirements.txt`, then `streamlit run app.py`
+- Deploy: on Streamlit Community Cloud, create an app from this repo, choose branch `main`, and set the main file to `app.py`.
+
+## Notebook
+
+Open the notebook in Google Colab and run the cells, or run it locally in Jupyter after `pip install -r requirements.txt`.
+
+If you change the model in the notebook, make the same change in `app.py`. The two are separate copies of the logic.
 
 ## Syncing from Colab
 
