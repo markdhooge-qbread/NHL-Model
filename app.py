@@ -63,6 +63,7 @@ st.markdown(
 
 B2B_BADGE = " <span class='badge b2b'>B2B</span>"
 BACKUP_BADGE = " <span class='badge backup'>BACKUP</span>"
+SMALL_SAMPLE_BADGE = " <span class='badge bal'>&lt;5 GP</span>"
 
 
 # ----------------------------------------------------------------------------
@@ -91,6 +92,28 @@ def load_boxscore(game_id):
     resp = requests.get(f"{NHL_API}/gamecenter/{game_id}/boxscore", timeout=15)
     resp.raise_for_status()
     return resp.json()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_roster(abbr):
+    """Current NHL roster skater ids for a team, or None if unavailable."""
+    try:
+        resp = requests.get(f"{NHL_API}/roster/{abbr}/current", timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:  # noqa: BLE001
+        return None
+    ids = {p.get("id") for grp in ("forwards", "defensemen") for p in data.get(grp, [])}
+    ids.discard(None)
+    return ids or None
+
+
+def dressed_ids(box, side):
+    """Skater ids who dressed for one side ('awayTeam'/'homeTeam'), or None before the game."""
+    team = box.get("playerByGameStats", {}).get(side, {})
+    ids = {p.get("playerId") for grp in ("forwards", "defense") for p in team.get(grp, [])}
+    ids.discard(None)
+    return ids or None
 
 
 def games_on(sched, date_str):
@@ -220,7 +243,7 @@ class Model:
         }
 
     # -- Player props -------------------------------------------------------
-    def project_skaters(self, team_abbr, opp_abbr, is_home, opp_gsax60, apply_b2b=True):
+    def project_skaters(self, team_abbr, opp_abbr, is_home, opp_gsax60, apply_b2b=True, player_ids=None):
         opp = self.get_team(opp_abbr)
         is_b2b = apply_b2b and team_abbr in self.b2b
         opp_b2b = apply_b2b and opp_abbr in self.b2b
@@ -232,7 +255,11 @@ class Model:
         goalie_mult = max(1.0 - (opp_gsax60 / 3.0), 0.75)
 
         sk = self.skaters_df
-        pool = sk[(sk["team"] == self.to_mp(team_abbr)) & (sk["games_played"] >= 5)]
+        pool = sk[(sk["team"] == self.to_mp(team_abbr)) & (sk["games_played"] >= 1)]
+        if player_ids:
+            in_lineup = pool[pool["playerId"].isin(player_ids)]
+            if not in_lineup.empty:
+                pool = in_lineup
         s_all = pool[pool["situation"] == "all"]
         s_5v5 = pool[pool["situation"] == "5on5"].set_index("playerId")
         s_pp = pool[pool["situation"] == "5on4"].set_index("playerId")
@@ -254,11 +281,11 @@ class Model:
             ast = ((p["I_F_primaryAssists"] + p["I_F_secondaryAssists"]) / all_hrs) * (toi_pg / 60.0) * xg_mult
             pts = xg + ast
             rows.append({
-                "playerId": pid, "name": p["name"], "pos": p["position"],
+                "playerId": pid, "name": p["name"], "pos": p["position"], "gp": gp,
                 "toi": toi_pg, "pp": pp_pg, "sog": sog, "xg": xg,
                 "atg": (1 - np.exp(-xg)) * 100, "pts": pts, "pt_p": (1 - np.exp(-pts)) * 100,
             })
-        cols = ["playerId", "name", "pos", "toi", "pp", "sog", "xg", "atg", "pts", "pt_p"]
+        cols = ["playerId", "name", "pos", "gp", "toi", "pp", "sog", "xg", "atg", "pts", "pt_p"]
         return pd.DataFrame(rows, columns=cols).sort_values("pts", ascending=False)
 
 
@@ -304,7 +331,8 @@ def slate_card(g, sim, ag, hg):
 
 def props_card(title, df):
     rows = "".join(
-        f"<tr><td><b>{r['name']}</b> <span class='card-sub'>({r['pos']})</span></td>"
+        f"<tr><td><b>{r['name']}</b> <span class='card-sub'>({r['pos']})</span>"
+        f"{SMALL_SAMPLE_BADGE if r['gp'] < 5 else ''}</td>"
         f"<td>{r['toi']:.1f}m <span style='color:#38bdf8;font-size:10px;'>({r['pp']:.1f} PP)</span></td>"
         f"<td><b>{r['sog']:.2f}</b></td>"
         f"<td>{r['xg']:.2f} ({r['atg']:.0f}%)</td>"
@@ -336,8 +364,10 @@ def parse_box_players(box):
 
 def backtest_rows(df, actual):
     html = ""
-    for _, r in df.head(6).iterrows():
-        act = actual.get(r["playerId"], {"g": 0, "a": 0, "pts": 0, "sog": 0})
+    for _, r in df.iterrows():
+        act = actual.get(r["playerId"])
+        if act is None:
+            continue
         html += (
             f"<tr><td><b>{r['name']}</b></td>"
             f"<td>{r['sog']:.1f} vs <b>{act['sog']}</b></td>"
@@ -419,12 +449,32 @@ with tab_props:
     pick = st.selectbox("Matchup", labels, key="props_game")
     g = games[labels.index(pick)]
     aa, ha = g["away"], g["home"]
-    n_show = st.slider("Skaters per team", 4, 14, 8)
+    show = st.radio("Show", ["All", "Top 8", "Top 12"], horizontal=True, key="props_show")
     try:
+        # Lineup: dressed skaters once the game has started, otherwise the current NHL roster.
+        a_ids = h_ids = None
+        lineup_src = "current NHL rosters"
+        if g["state"] not in ("FUT", "PRE"):
+            try:
+                box = load_boxscore(g["id"])
+                a_ids, h_ids = dressed_ids(box, "awayTeam"), dressed_ids(box, "homeTeam")
+                if a_ids and h_ids:
+                    lineup_src = "tonight's dressed lineups"
+            except Exception:  # noqa: BLE001
+                pass
+        a_ids = a_ids or load_roster(aa)
+        h_ids = h_ids or load_roster(ha)
+        if not (a_ids and h_ids):
+            lineup_src = "MoneyPuck season data (roster unavailable)"
+
         ag = model.get_goalie(aa, overrides.get(aa))
         hg = model.get_goalie(ha, overrides.get(ha))
-        df_a = model.project_skaters(aa, ha, False, hg["adj60"]).head(n_show)
-        df_h = model.project_skaters(ha, aa, True, ag["adj60"]).head(n_show)
+        df_a = model.project_skaters(aa, ha, False, hg["adj60"], player_ids=a_ids)
+        df_h = model.project_skaters(ha, aa, True, ag["adj60"], player_ids=h_ids)
+        if show != "All":
+            n = int(show.split()[1])
+            df_a, df_h = df_a.head(n), df_h.head(n)
+        st.caption(f"{len(df_a)} {aa} and {len(df_h)} {ha} skaters, from {lineup_src}. Sorted by projected points.")
         hg_b = BACKUP_BADGE if hg["is_backup"] else ""
         ag_b = BACKUP_BADGE if ag["is_backup"] else ""
         a_b = B2B_BADGE if aa in b2b_teams else ""
@@ -466,8 +516,10 @@ with tab_bt:
             hit = "✅ HIT" if pred_w == act_w else "❌ MISS"
 
         actual = parse_box_players(box)
-        a_rows = backtest_rows(model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False), actual)
-        h_rows = backtest_rows(model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False), actual)
+        a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
+        h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
+        a_rows = backtest_rows(a_df, actual) or "<tr><td colspan='3'>No box score yet</td></tr>"
+        h_rows = backtest_rows(h_df, actual) or "<tr><td colspan='3'>No box score yet</td></tr>"
         sog_diff = act_h_sog - act_a_sog
 
         st.markdown(
@@ -484,11 +536,11 @@ with tab_bt:
                 <tr><td><b>Total Goals</b></td><td>{sim['proj_tot']:.2f}</td><td><b>{act_tot}</b></td><td>{act_tot - sim['proj_tot']:+.2f}</td></tr>
                 <tr><td><b>Shots on Goal</b></td><td>Pace {sim['a']['ca60']:.0f} / {sim['h']['ca60']:.0f}</td><td><b>{act_a_sog} — {act_h_sog}</b></td><td>{ha} {sog_diff:+d}</td></tr>
               </table></div>
-              <div class='section'>{aa} Top Skaters (Proj vs Actual)</div>
+              <div class='section'>{aa} Skaters (Proj vs Actual)</div>
               <div class='tbl-wrap'><table class='tbl' style='margin-bottom:10px;'>
                 <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{a_rows}
               </table></div>
-              <div class='section'>{ha} Top Skaters (Proj vs Actual)</div>
+              <div class='section'>{ha} Skaters (Proj vs Actual)</div>
               <div class='tbl-wrap'><table class='tbl'>
                 <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{h_rows}
               </table></div>
