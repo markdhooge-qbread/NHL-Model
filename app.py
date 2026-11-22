@@ -377,6 +377,7 @@ class Model:
             "proj_a": af.mean(), "proj_h": hf.mean(), "proj_tot": tot.mean(),
             "a_win": (af > hf).mean(), "h_win": (hf > af).mean(),
             "o55": (tot > 5.5).mean(),
+            "tot_pmf": np.bincount(tot) / len(tot),
         }
 
     # -- Player props -------------------------------------------------------
@@ -708,6 +709,100 @@ def skater_compare_card(aa, a_df, ha, h_df, actual):
 
 
 # ----------------------------------------------------------------------------
+# Bets board helpers
+# ----------------------------------------------------------------------------
+STATUS_ICON = {"pregame": "⚪", "on": "🟢", "off": "🟠", "tied": "🟡", "hit": "✅", "miss": "❌", "push": "➖"}
+STATUS_TEXT = {"pregame": "Pregame", "on": "On pace", "off": "Off pace", "tied": "Tied",
+               "hit": "Hit", "miss": "Miss", "push": "Push"}
+
+
+def pmf_over_under(pmf, line):
+    """Over / under / push probabilities from a goals PMF."""
+    ks = np.arange(len(pmf))
+    over = float(pmf[ks > line].sum())
+    push = float(pmf[ks == line].sum()) if float(line).is_integer() else 0.0
+    return over, max(1.0 - over - push, 0.0), push
+
+
+def default_total_line(proj_tot):
+    return 6.5 if proj_tot >= 6.0 else 5.5
+
+
+def default_sog_line(mean):
+    return 1.5 if mean < 2.2 else (2.5 if mean < 3.4 else 3.5)
+
+
+def elapsed_fraction(live):
+    """Share of regulation played (0-1) from a scoreboard entry; None before puck drop."""
+    if not live or live.get("gameState") not in LIVE_STATES + FINAL_STATES:
+        return None
+    if live.get("gameState") in FINAL_STATES:
+        return 1.0
+    pdesc = live.get("periodDescriptor", {}) or {}
+    clock = live.get("clock", {}) or {}
+    num = pdesc.get("number") or 1
+    if num > 3 or pdesc.get("periodType") in ("OT", "SO"):
+        return 1.0
+    if clock.get("inIntermission"):
+        return min(num * 20.0 / 60.0, 1.0)
+    try:
+        mm, ss = str(clock.get("timeRemaining", "20:00")).split(":")
+        remaining = int(mm) + int(ss) / 60.0
+    except ValueError:
+        remaining = 20.0
+    return max(min(((num - 1) * 20.0 + (20.0 - remaining)) / 60.0, 1.0), 0.0)
+
+
+def grade_count(side, line, current, final, frac):
+    """Status for an over/under on a counting stat (goals, SOG, points)."""
+    if frac is None:
+        return "pregame", None
+    pace = current / max(frac, 0.08) if frac < 1.0 else float(current)
+    if side == "Over" and current > line:
+        return "hit", pace
+    if side == "Under" and current > line:
+        return "miss", pace
+    if final:
+        if current == line:
+            return "push", pace
+        return ("hit" if side == "Under" else "miss"), pace
+    return ("on" if (pace > line) == (side == "Over") else "off"), pace
+
+
+def choose_side(p_over, p_under, odds_over, odds_under):
+    """Pick the side with the higher model chance; return side, model %, odds, implied %, edge."""
+    if p_over >= p_under:
+        side, p, odds = "Over", p_over, odds_over
+    else:
+        side, p, odds = "Under", p_under, odds_under
+    imp = american_to_prob(odds) if odds is not None else None
+    edge = (p - imp) * 100 if imp else None
+    return side, p, odds, imp, edge
+
+
+def bet_row_label(b):
+    icon = STATUS_ICON[b["status"]]
+    edge = f" · edge {b['edge']:+.0f}" if b["edge"] is not None else ""
+    return f"{icon} **{b['pick']}** · {b['p']*100:.0f}%{edge} · {b['now']}"
+
+
+def bet_detail_card(b):
+    odds_txt = f"{b['odds']:+d} ({b['imp']*100:.1f}% implied)" if b["odds"] is not None and b["imp"] else "not entered"
+    edge_txt = f"{b['edge']:+.1f}%" if b["edge"] is not None else "—"
+    return f"""
+    <div class='card'>
+      <div class='section'>{b['pick']} <span class='card-sub'>· {b['game']} · {b['time']}</span></div>
+      <div class='tbl-wrap'><table class='tbl'>
+        <tr><th>Pregame (locked)</th><th>Live / result</th></tr>
+        <tr><td>Proj {b['proj_txt']}<br>Model {b['p']*100:.1f}% · fair {prob_to_american(b['p'])}</td>
+            <td>{STATUS_ICON[b['status']]} {STATUS_TEXT[b['status']]}<br>{b['now']}</td></tr>
+        <tr><td>Line {b['line_txt']} · odds {odds_txt}</td><td>Edge {edge_txt}</td></tr>
+      </table></div>
+    </div>
+    """
+
+
+# ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 st.title("🏒 NHL Game Flow Model")
@@ -752,9 +847,9 @@ with st.expander("🥅 Goalie overrides"):
         "Goalie", options, index=options.index(current) if current in options else 0, key=f"ovr_goalie_{sel_team}"
     )
     b1, b2 = st.columns(2)
-    if b1.button("Swap & re-sim", type="primary", use_container_width=True) and sel_goalie:
+    if b1.button("Swap & re-sim", type="primary", width="stretch") and sel_goalie:
         overrides[sel_team] = sel_goalie
-    if b2.button("Reset all", use_container_width=True):
+    if b2.button("Reset all", width="stretch"):
         overrides.clear()
     if overrides:
         st.caption("Active: " + ", ".join(f"{t}: {n}" for t, n in sorted(overrides.items())))
@@ -781,7 +876,7 @@ def resolve_goalie(g, side, use_override=True):
     )
 
 
-tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Slate", "Player Props", "Live Tracker", "Record"])
+tab_bets, tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Bets", "Slate", "Player Props", "Live Tracker", "Record"])
 
 with tab_slate:
     slate_open = st.toggle("Expand all games", key="slate_expand_all")
@@ -876,7 +971,7 @@ with tab_props:
             </div>
             """)
         st.caption("Model % assumes a Poisson count around the projected mean. Edge is the model's chance minus the market's no-vig chance; green ≥ +3%.")
-        st.link_button("Open NHL player props on DraftKings ↗", DK_NHL_URL, use_container_width=True)
+        st.link_button("Open NHL player props on DraftKings ↗", DK_NHL_URL, width="stretch")
 
     st.divider()
 
@@ -917,6 +1012,197 @@ with tab_props:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not project {aa} @ {ha}: {exc}")
 
+
+def build_bets(scores, bet_overrides):
+    """Every game (ML, total) and player (SOG, points, goal) pick on the slate, with status."""
+    bets = []
+    for g in games:
+        aa, ha, gid = g["away"], g["home"], g["id"]
+        live = scores.get(gid, {})
+        frac = elapsed_fraction(live)
+        final = live.get("gameState") in FINAL_STATES
+        a_now = (live.get("awayTeam", {}) or {}).get("score") or 0
+        h_now = (live.get("homeTeam", {}) or {}).get("score") or 0
+        status_txt = game_status(g, live or None)
+        clock_txt = status_txt["text"] if status_txt["kind"] == "live" else ("Final" if final else g["time"])
+        game_lbl = f"{aa} @ {ha}"
+        try:
+            ag, hg, df_a, df_h, _ = project_game(g)
+            sim = model.simulate_game(aa, ha, ag, hg)
+        except Exception:  # noqa: BLE001
+            continue
+
+        # Moneyline: model's side; odds only if entered.
+        bid = f"{gid}-ML"
+        ov = bet_overrides.get(bid, {})
+        pick_team = aa if sim["a_win"] >= sim["h_win"] else ha
+        p = max(sim["a_win"], sim["h_win"])
+        odds = ov.get("odds")
+        imp = american_to_prob(odds) if odds is not None else None
+        if frac is None:
+            status, now = "pregame", g["time"]
+        else:
+            mine, theirs = (a_now, h_now) if pick_team == aa else (h_now, a_now)
+            if final:
+                status = "hit" if mine > theirs else "miss"
+            else:
+                status = "on" if mine > theirs else ("off" if mine < theirs else "tied")
+            now = f"{aa} {a_now}–{h_now} {ha} · {clock_txt}"
+        bets.append({"id": bid, "kind": "Game", "market": "ML", "pick": f"{pick_team} ML ({game_lbl})",
+                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp,
+                     "edge": (p - imp) * 100 if imp else None, "line": None, "line_txt": "ML",
+                     "proj_txt": f"{aa} {sim['proj_a']:.2f} – {sim['proj_h']:.2f} {ha}",
+                     "status": status, "now": now})
+
+        # Game total
+        bid = f"{gid}-TOT"
+        ov = bet_overrides.get(bid, {})
+        line = ov.get("line", default_total_line(sim["proj_tot"]))
+        p_o, p_u, _ = pmf_over_under(sim["tot_pmf"], line)
+        side, p, odds, imp, edge = choose_side(p_o, p_u, ov.get("odds"), ov.get("odds"))
+        status, pace = grade_count(side, line, a_now + h_now, final, frac)
+        now = g["time"] if frac is None else f"{a_now + h_now} goals · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
+        bets.append({"id": bid, "kind": "Game", "market": "Total", "pick": f"{game_lbl} {side[0]} {line:g}",
+                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
+                     "line": line, "line_txt": f"{side} {line:g}", "proj_txt": f"{sim['proj_tot']:.2f} goals",
+                     "status": status, "now": now})
+
+        # Players
+        box = boxes.get(gid)
+        actual = parse_box_players(box) if box else {}
+        for df, team in ((df_a, aa), (df_h, ha)):
+            for _, r in df.iterrows():
+                act = actual.get(r["playerId"], {"g": 0, "a": 0, "pts": 0, "sog": 0})
+                last = r["name"].split()[-1] if isinstance(r["name"], str) else r["name"]
+                markets = (
+                    ("SOG", "sog", default_sog_line(r["sog"]), act["sog"], None),
+                    ("Pts", "pts", 0.5, act["pts"], None),
+                    ("Goal", "xg", 0.5, act["g"], None),
+                )
+                for mkt, key, dline, cur, dodds in markets:
+                    bid = f"{gid}-{r['playerId']}-{mkt}"
+                    ov = bet_overrides.get(bid, {})
+                    line = ov.get("line", dline)
+                    p_o, p_u, _ = line_probs(float(r[key]), line)
+                    odds_val = ov.get("odds", dodds)
+                    if mkt == "Goal":
+                        side, p, odds = "Over", p_o, odds_val
+                        imp = american_to_prob(odds) if odds is not None else None
+                        edge = (p - imp) * 100 if imp else None
+                        pick = f"{r['name']} ({team}) anytime goal"
+                        line_txt = "Anytime goal"
+                    else:
+                        side, p, odds, imp, edge = choose_side(p_o, p_u, odds_val, odds_val)
+                        pick = f"{r['name']} ({team}) {side[0]} {line:g} {mkt}"
+                        line_txt = f"{side} {line:g} {mkt}"
+                    in_lineup = (r["playerId"] in actual) if actual else True
+                    status, pace = grade_count(side, line, cur, final, frac if in_lineup else None)
+                    if frac is None or not in_lineup:
+                        now = g["time"] if in_lineup else "Not in lineup"
+                    else:
+                        now = f"{cur} {mkt} · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
+                    bets.append({"id": bid, "kind": "Player", "market": mkt, "pick": pick, "game": game_lbl,
+                                 "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
+                                 "line": line, "line_txt": line_txt,
+                                 "proj_txt": f"{float(r[key]):.2f} {mkt}", "status": status, "now": now})
+    return bets
+
+
+with tab_bets:
+    if "bet_overrides" not in st.session_state:
+        st.session_state.bet_overrides = {}
+    bet_overrides = st.session_state.bet_overrides
+
+    c1, c2 = st.columns(2)
+    bet_kind = c1.radio("Show", ["All", "Games", "Players"], horizontal=True, key="bets_kind")
+    min_p = c2.slider("Min model %", 50, 80, 55, step=1, key="bets_min_p")
+    c3, c4 = st.columns(2)
+    n_show = c3.selectbox("How many", [15, 25, 50, 100], index=1, key="bets_n")
+    status_f = c4.selectbox("Status", ["Any", "Pregame", "Live", "Settled"], key="bets_status")
+
+    try:
+        scores_now = load_scores(date_str)
+    except Exception:  # noqa: BLE001
+        scores_now = {}
+    all_bets = build_bets(scores_now, bet_overrides)
+
+    def keep(b):
+        if bet_kind == "Games" and b["kind"] != "Game":
+            return False
+        if bet_kind == "Players" and b["kind"] != "Player":
+            return False
+        if b["p"] * 100 < min_p:
+            return False
+        if status_f == "Pregame" and b["status"] != "pregame":
+            return False
+        if status_f == "Live" and b["status"] not in ("on", "off", "tied"):
+            return False
+        if status_f == "Settled" and b["status"] not in ("hit", "miss", "push"):
+            return False
+        return True
+
+    rank_by = st.radio("Rank by", ["Model %", "Edge (odds entered)"], horizontal=True, key="bets_rank")
+
+    def rank_key(b):
+        if rank_by.startswith("Edge"):
+            return (b["edge"] is not None, b["edge"] if b["edge"] is not None else b["p"] * 100)
+        return (True, b["p"] * 100)
+
+    shown = sorted((b for b in all_bets if keep(b)), key=rank_key, reverse=True)[:n_show]
+    settled = [b for b in shown if b["status"] in ("hit", "miss")]
+    live_n = sum(b["status"] in ("on", "off", "tied") for b in shown)
+    on_n = sum(b["status"] == "on" for b in shown)
+    summary = f"{len(shown)} picks"
+    if live_n:
+        summary += f" · {on_n}/{live_n} live on pace"
+    if settled:
+        summary += f" · {sum(b['status'] == 'hit' for b in settled)}-{sum(b['status'] == 'miss' for b in settled)} settled"
+    st.caption(summary + ". ⚪ pregame · 🟢 on pace · 🟠 off pace · 🟡 tied · ✅ hit · ❌ miss")
+
+    if not shown:
+        st.info("No picks match these filters. Try lowering the minimum model %.")
+    for b in shown:
+        with st.expander(bet_row_label(b)):
+            st_html(bet_detail_card(b))
+
+    with st.expander("✏️ Edit lines & odds"):
+        st.caption("Type the book's line and American odds for any pick. Edge = model % minus the odds' implied %; "
+                   "picks without odds show model % only.")
+        ed = pd.DataFrame([{"id": b["id"], "Pick": b["pick"], "Line": b["line"], "Odds": b["odds"]} for b in shown])
+        if not ed.empty:
+            edited = st.data_editor(
+                ed, key="bets_editor", hide_index=True, width="stretch",
+                column_config={
+                    "id": None,
+                    "Pick": st.column_config.TextColumn(disabled=True),
+                    "Line": st.column_config.NumberColumn(step=0.5, min_value=0.0, max_value=15.0),
+                    "Odds": st.column_config.NumberColumn(step=5, min_value=-2000, max_value=5000),
+                },
+            )
+            changed = False
+            for (_, before), (_, after) in zip(ed.iterrows(), edited.iterrows()):
+                ov = dict(bet_overrides.get(after["id"], {}))
+                for col, key in (("Line", "line"), ("Odds", "odds")):
+                    new, old = after[col], before[col]
+                    if pd.isna(new) and pd.isna(old):
+                        continue
+                    if pd.isna(new) or pd.isna(old) or float(new) != float(old):
+                        if pd.isna(new):
+                            ov.pop(key, None)
+                        else:
+                            ov[key] = float(new) if key == "line" else int(new)
+                        changed = True
+                bet_overrides[after["id"]] = ov
+            if changed:
+                # Rows can re-rank after an edit, so drop the editor's row-indexed edits before re-rendering.
+                st.session_state.pop("bets_editor", None)
+                st.rerun()
+        if st.button("Reset all lines", key="bets_reset"):
+            bet_overrides.clear()
+            st.session_state.pop("bets_editor", None)
+            st.rerun()
+        st.link_button("Open NHL lines on DraftKings ↗", DK_NHL_URL, width="stretch")
+
 with tab_live:
     now_et = datetime.datetime.now(EST)
 
@@ -935,7 +1221,7 @@ with tab_live:
         c1, c2 = st.columns([3, 1])
         c1.caption("Auto-refreshes every 60s while games are live." if any_live else "Projection vs. live/final box score.")
         live_open = st.session_state.get("live_expand_all", False)
-        if c2.button("Refresh", use_container_width=True, key="live_refresh"):
+        if c2.button("Refresh", width="stretch", key="live_refresh"):
             load_scores.clear()
             load_boxscore.clear()
 
@@ -1030,7 +1316,7 @@ with tab_rec:
             </table></div></div>
             """)
 
-    if st.button("Grade the last 7 slates", use_container_width=True, key="grade_week"):
+    if st.button("Grade the last 7 slates", width="stretch", key="grade_week"):
         hist = ""
         d = last_done
         graded = 0
