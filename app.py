@@ -34,7 +34,14 @@ SEASON_START = datetime.date(SEASON, 10, 1)
 
 st.set_page_config(page_title="NHL Game Flow Model", page_icon="🏒", layout="centered")
 
-st.markdown(
+
+def st_html(content):
+    """Render HTML via st.markdown. Lines are left-stripped and blank lines dropped so Markdown
+    never treats indented HTML as a code block (which shows raw tags)."""
+    lines = [ln.strip() for ln in str(content).splitlines()]
+    st.markdown("\n".join(ln for ln in lines if ln), unsafe_allow_html=True)
+
+st_html(
     """
     <style>
       .block-container {padding-top: 1.2rem; padding-left: 0.8rem; padding-right: 0.8rem;}
@@ -66,9 +73,7 @@ st.markdown(
       .dot.sched {background:#64748b;}
       @keyframes pulse {0% {box-shadow:0 0 0 0 rgba(34,197,94,.7);} 70% {box-shadow:0 0 0 7px rgba(34,197,94,0);} 100% {box-shadow:0 0 0 0 rgba(34,197,94,0);}}
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """)
 
 B2B_BADGE = " <span class='badge b2b'>B2B</span>"
 BACKUP_BADGE = " <span class='badge backup'>BACKUP</span>"
@@ -643,11 +648,9 @@ games = games_on(sched, date_str)
 b2b_teams = teams_played_on(sched_prev, prev_str)
 model = Model(teams_df, goalies_df, skaters_df, b2b_teams)
 
-st.markdown(
+st_html(
     f"<div class='meta'>📅 <b>{date_str}</b> ({len(games)} games) &nbsp;|&nbsp; "
-    f"Auto-B2B: <b>{', '.join(sorted(b2b_teams)) if b2b_teams else 'None'}</b></div>",
-    unsafe_allow_html=True,
-)
+    f"Auto-B2B: <b>{', '.join(sorted(b2b_teams)) if b2b_teams else 'None'}</b></div>")
 
 if not games:
     st.info("No games scheduled for this date.")
@@ -708,7 +711,7 @@ with tab_slate:
             cards.append(slate_card(g, sim, ag, hg))
         except Exception as exc:  # noqa: BLE001
             cards.append(f"<div class='card'>{g['away']} @ {g['home']}: could not simulate ({exc})</div>")
-    st.markdown("".join(cards), unsafe_allow_html=True)
+    st_html("".join(cards))
 
 def project_game(g):
     """Goalies and skater projections for one game, using the best available lineup."""
@@ -728,7 +731,7 @@ def project_game(g):
 
 with tab_props:
     # -- Player search + prop line checker --------------------------------
-    st.markdown("<div class='section'>🔎 Player search & line check</div>", unsafe_allow_html=True)
+    st_html("<div class='section'>🔎 Player search & line check</div>")
     index = []
     for g in games:
         try:
@@ -743,11 +746,9 @@ with tab_props:
     sel = st.selectbox("Player", labels_ix, index=None, placeholder="Type a name: anyone playing tonight", key="search_player")
     if sel:
         r = index[labels_ix.index(sel)]
-        st.markdown(
+        st_html(
             props_card(f"{r['name']} · {r['team']} vs {r['opp']} ({r['time']}) · opp G {r['opp_goalie']['name']}{goalie_badges(r['opp_goalie'])}",
-                       pd.DataFrame([r])),
-            unsafe_allow_html=True,
-        )
+                       pd.DataFrame([r])))
         markets = {"Shots on Goal": ("sog", 2.5), "Points": ("pts", 0.5), "Goals": ("xg", 0.5)}
         c1, c2 = st.columns(2)
         market = c1.selectbox("Market", list(markets), key="lc_market")
@@ -776,7 +777,7 @@ with tab_props:
             return f"<b style='color:{color}'>{e:+.1f}%</b>"
 
         push_txt = f" · Push {p_push*100:.0f}%" if p_push > 0 else ""
-        st.markdown(
+        st_html(
             f"""
             <div class='card'>
               <div class='section'>{market} {line:g} · model mean {lam:.2f}{push_txt}</div>
@@ -786,9 +787,7 @@ with tab_props:
                 <tr><td><b>Under</b></td><td>{p_under*100:.1f}%</td><td>{prob_to_american(m_u)}</td><td>{f"{imp_u*100:.1f}%" if imp_u else "—"}</td><td>{edge_cell(edge_u)}</td></tr>
               </table></div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            """)
         st.caption("Model % assumes a Poisson count around the projected mean. Edge is the model's chance minus the market's no-vig chance; green ≥ +3%.")
 
     st.divider()
@@ -807,11 +806,9 @@ with tab_props:
         st.caption(f"{len(df_a)} {aa} and {len(df_h)} {ha} skaters, from {lineup_src}. Sorted by projected points.")
         a_b = B2B_BADGE if aa in b2b_teams else ""
         h_b = B2B_BADGE if ha in b2b_teams else ""
-        st.markdown(
+        st_html(
             props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a)
-            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h),
-            unsafe_allow_html=True,
-        )
+            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h))
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not project {aa} @ {ha}: {exc}")
 
@@ -875,13 +872,13 @@ with tab_live:
             try:
                 ag, hg = resolve_goalie(g, "away", use_override=False), resolve_goalie(g, "home", use_override=False)
                 sim = model.simulate_game(aa, ha, ag, hg)
-                st.markdown(live_card(g, box, status, sim), unsafe_allow_html=True)
+                st_html(live_card(g, box, status, sim))
                 if box and status["kind"] != "sched":
                     actual = parse_box_players(box)
                     a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
                     h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
                     with st.expander(f"{aa} @ {ha} skaters: proj vs actual"):
-                        st.markdown(skater_compare_card(aa, a_df, ha, h_df, actual), unsafe_allow_html=True)
+                        st_html(skater_compare_card(aa, a_df, ha, h_df, actual))
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not load {aa} @ {ha}: {exc}")
 
@@ -926,7 +923,7 @@ with tab_rec:
                     f"<td>{r['proj_a']:.1f}–{r['proj_h']:.1f}</td><td><b>{r['a_goals']}–{r['h_goals']}</b>{sfx}</td>"
                     f"<td>{r['pick']} {'✅' if r['hit'] else '❌'}</td></tr>"
                 )
-            st.markdown(
+            st_html(
                 f"""
                 <div class='card'>
                   <div class='section'>By confidence · last 7 days {l7}</div>
@@ -940,9 +937,7 @@ with tab_rec:
                     <tr><th>Date</th><th>Game</th><th>Proj</th><th>Final</th><th>Pick</th></tr>{recent}
                   </table></div>
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                """)
             st.caption(
                 "Graded with today's season-to-date MoneyPuck stats and each team's #1 goalie, so earlier games are "
                 "partly in-sample and this record runs a bit optimistic. Shootout wins count for the winner."
