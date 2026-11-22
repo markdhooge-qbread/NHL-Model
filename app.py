@@ -608,6 +608,20 @@ def live_card(g, box, status, sim):
     """
 
 
+def live_label(g, box, status):
+    """One-line collapsed row: status dot, clock, and score (or start time)."""
+    aa, ha = g["away"], g["home"]
+    box = box or {}
+    if status["kind"] == "sched":
+        return f"⚪ {g['time']} · **{aa} @ {ha}**"
+    a = box.get("awayTeam", {}).get("score") or 0
+    h = box.get("homeTeam", {}).get("score") or 0
+    if status["kind"] == "live":
+        clock = f" {status['text']}" if status["text"] else ""
+        return f"🟢 LIVE{clock} · **{aa} {a} – {h} {ha}**"
+    return f"🔴 {status['label']} · **{aa} {a} – {h} {ha}**"
+
+
 def skater_compare_card(aa, a_df, ha, h_df, actual):
     empty = "<tr><td colspan='3'>No box score yet</td></tr>"
     a_rows = backtest_rows(a_df, actual) or empty
@@ -703,15 +717,21 @@ def resolve_goalie(g, side, use_override=True):
 tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Slate", "Player Props", "Live Tracker", "Record"])
 
 with tab_slate:
-    cards = []
+    slate_open = st.toggle("Expand all games", key="slate_expand_all")
     for g in games:
+        aa, ha = g["away"], g["home"]
         try:
             ag, hg = resolve_goalie(g, "away"), resolve_goalie(g, "home")
-            sim = model.simulate_game(g["away"], g["home"], ag, hg)
-            cards.append(slate_card(g, sim, ag, hg))
+            sim = model.simulate_game(aa, ha, ag, hg)
+            fav = aa if sim["a_win"] >= sim["h_win"] else ha
+            fav_p = max(sim["a_win"], sim["h_win"]) * 100
+            b2b = " · B2B" if (sim["a_b2b"] or sim["h_b2b"]) else ""
+            label = (f"**{aa} @ {ha}** · {g['time']} · {sim['proj_a']:.1f}–{sim['proj_h']:.1f}"
+                     f" · {fav} {fav_p:.0f}% · Tot {sim['proj_tot']:.1f}{b2b}")
+            with st.expander(label, expanded=slate_open):
+                st_html(slate_card(g, sim, ag, hg))
         except Exception as exc:  # noqa: BLE001
-            cards.append(f"<div class='card'>{g['away']} @ {g['home']}: could not simulate ({exc})</div>")
-    st_html("".join(cards))
+            st.error(f"{aa} @ {ha}: could not simulate ({exc})")
 
 def project_game(g):
     """Goalies and skater projections for one game, using the best available lineup."""
@@ -823,10 +843,13 @@ with tab_live:
         g["state"] in LIVE_STATES or (g["state"] not in FINAL_STATES and g["start"] <= now_et) for g in games
     )
 
+    st.toggle("Expand all games", key="live_expand_all")
+
     @st.fragment(run_every=60 if any_live else None)
     def live_tracker():
         c1, c2 = st.columns([3, 1])
         c1.caption("Auto-refreshes every 60s while games are live." if any_live else "Projection vs. live/final box score.")
+        live_open = st.session_state.get("live_expand_all", False)
         if c2.button("Refresh", use_container_width=True, key="live_refresh"):
             load_scores.clear()
             load_boxscore.clear()
@@ -872,12 +895,12 @@ with tab_live:
             try:
                 ag, hg = resolve_goalie(g, "away", use_override=False), resolve_goalie(g, "home", use_override=False)
                 sim = model.simulate_game(aa, ha, ag, hg)
-                st_html(live_card(g, box, status, sim))
-                if box and status["kind"] != "sched":
-                    actual = parse_box_players(box)
-                    a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
-                    h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
-                    with st.expander(f"{aa} @ {ha} skaters: proj vs actual"):
+                with st.expander(live_label(g, box, status), expanded=live_open):
+                    st_html(live_card(g, box, status, sim))
+                    if box and status["kind"] != "sched":
+                        actual = parse_box_players(box)
+                        a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
+                        h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
                         st_html(skater_compare_card(aa, a_df, ha, h_df, actual))
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not load {aa} @ {ha}: {exc}")
