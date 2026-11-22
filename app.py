@@ -4,10 +4,12 @@ Streamlit port of notebooks/player_model.ipynb:
   1. Slate Sim   - 10,000-iteration Gamma-Poisson Monte Carlo per game
   2. Player Props - SOG, anytime goal %, and 1+ point % for top skaters
   3. Live Tracker - every game's status, period/clock, and model vs. live/final box score
+  4. Record       - season-to-date winner hit rate and goal error on final games
 """
 
 import datetime
 import io
+import math
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -28,6 +30,7 @@ B2B_DEF = 1.04   # 4% defensive fatigue penalty (opponent of a B2B team gains)
 MP_BASE = "https://moneypuck.com/moneypuck/playerData/seasonSummary"
 NHL_API = "https://api-web.nhle.com/v1"
 MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
+SEASON_START = datetime.date(SEASON, 10, 1)
 
 st.set_page_config(page_title="NHL Game Flow Model", page_icon="🏒", layout="centered")
 
@@ -50,6 +53,7 @@ st.markdown(
       .tbl td:first-child, .tbl th:first-child {text-align:left;}
       .badge {padding:1px 5px;border-radius:4px;font-size:10px;font-weight:700;white-space:nowrap;}
       .b2b {background:#b45309;color:#fde68a;}
+      .conf {background:#14532d;color:#86efac;}
       .backup {background:#991b1b;color:#fecaca;}
       .track {background:#7f1d1d;color:#fca5a5;}
       .lowev {background:#1e3a8a;color:#93c5fd;}
@@ -69,6 +73,11 @@ st.markdown(
 B2B_BADGE = " <span class='badge b2b'>B2B</span>"
 BACKUP_BADGE = " <span class='badge backup'>BACKUP</span>"
 SMALL_SAMPLE_BADGE = " <span class='badge bal'>&lt;5 GP</span>"
+CONFIRMED_BADGE = " <span class='badge conf'>✓ CONFIRMED</span>"
+
+
+def goalie_badges(gl):
+    return (CONFIRMED_BADGE if gl.get("source") == "confirmed" else "") + (BACKUP_BADGE if gl["is_backup"] else "")
 
 
 # ----------------------------------------------------------------------------
@@ -119,6 +128,108 @@ def dressed_ids(box, side):
     ids = {p.get("playerId") for grp in ("forwards", "defense") for p in team.get(grp, [])}
     ids.discard(None)
     return ids or None
+
+
+def starter_goalie_id(box, side):
+    """NHL-confirmed starting goalie id for 'awayTeam'/'homeTeam', or None."""
+    if not box:
+        return None
+    for p in box.get("playerByGameStats", {}).get(side, {}).get("goalies", []):
+        if p.get("starter"):
+            return p.get("playerId")
+    return None
+
+
+def poisson_cdf(k, lam):
+    """P(X <= k) for X ~ Poisson(lam)."""
+    if k < 0:
+        return 0.0
+    term = total = math.exp(-lam)
+    for i in range(1, int(k) + 1):
+        term *= lam / i
+        total += term
+    return min(total, 1.0)
+
+
+def line_probs(lam, line):
+    """Over / under / push probabilities for a Poisson mean against a prop line."""
+    if float(line).is_integer():
+        k = int(line)
+        under = poisson_cdf(k - 1, lam)
+        push = poisson_cdf(k, lam) - under
+        return 1.0 - under - push, under, push
+    under = poisson_cdf(math.floor(line), lam)
+    return 1.0 - under, under, 0.0
+
+
+def american_to_prob(odds):
+    if odds is None or odds == 0 or -100 < odds < 100:
+        return None
+    return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
+
+
+def prob_to_american(p):
+    if p <= 0 or p >= 1:
+        return "—"
+    return f"{-100.0 * p / (1 - p):+.0f}" if p >= 0.5 else f"+{100.0 * (1 - p) / p:.0f}"
+
+
+@st.cache_data(ttl=3600, show_spinner="Loading season results...")
+def load_season_games(start_str, end_str):
+    """Completed regular-season games between two dates, plus teams that played each day."""
+    start = datetime.date.fromisoformat(start_str)
+    end = datetime.date.fromisoformat(end_str)
+    finals, played = {}, {}
+    d = start
+    while d <= end:
+        try:
+            resp = requests.get(f"{NHL_API}/schedule/{d.isoformat()}", timeout=15)
+            resp.raise_for_status()
+            week = resp.json().get("gameWeek", [])
+        except Exception:  # noqa: BLE001
+            week = []
+        for day in week:
+            ds = day.get("date")
+            for g in day.get("games", []):
+                played.setdefault(ds, set()).update({g["awayTeam"]["abbrev"], g["homeTeam"]["abbrev"]})
+                if g.get("gameType", 2) != 2 or g.get("gameState") not in ("FINAL", "OFF"):
+                    continue
+                if not (start_str <= ds <= end_str):
+                    continue
+                finals[g["id"]] = {
+                    "id": g["id"], "date": ds,
+                    "away": g["awayTeam"]["abbrev"], "home": g["homeTeam"]["abbrev"],
+                    "a_goals": g["awayTeam"].get("score", 0) or 0, "h_goals": g["homeTeam"].get("score", 0) or 0,
+                    "last": (g.get("gameOutcome") or {}).get("lastPeriodType", "REG"),
+                }
+        d += datetime.timedelta(days=7)
+    return sorted(finals.values(), key=lambda x: (x["date"], x["id"])), played
+
+
+@st.cache_data(ttl=3600, show_spinner="Grading the model on this season's games...")
+def season_record(season, start_str, end_str):
+    teams_df, goalies_df, skaters_df = load_moneypuck(season)
+    finals, played = load_season_games(start_str, end_str)
+    rows = []
+    for g in finals:
+        prev = (datetime.date.fromisoformat(g["date"]) - datetime.timedelta(days=1)).isoformat()
+        m = Model(teams_df, goalies_df, skaters_df, played.get(prev, set()))
+        try:
+            sim = m.simulate_game(g["away"], g["home"], m.get_goalie(g["away"]), m.get_goalie(g["home"]), seed=g["id"] % 100000)
+        except Exception:  # noqa: BLE001
+            continue
+        pick = g["away"] if sim["a_win"] > sim["h_win"] else g["home"]
+        winner = g["away"] if g["a_goals"] > g["h_goals"] else g["home"]
+        act_tot = g["a_goals"] + g["h_goals"]
+        rows.append({
+            "date": g["date"], "away": g["away"], "home": g["home"],
+            "proj_a": sim["proj_a"], "proj_h": sim["proj_h"], "proj_tot": sim["proj_tot"],
+            "a_goals": g["a_goals"], "h_goals": g["h_goals"], "act_tot": act_tot, "last": g["last"],
+            "pick": pick, "pick_p": max(sim["a_win"], sim["h_win"]), "hit": pick == winner,
+            "o55_p": sim["o55"], "o55_hit": (sim["o55"] >= 0.5) == (act_tot > 5.5),
+            "tot_err": act_tot - sim["proj_tot"],
+        })
+    return pd.DataFrame(rows)
 
 
 def games_on(sched, date_str):
@@ -189,14 +300,20 @@ class Model:
         g = self.goalies_df
         return g[(g["situation"] == "all") & (g["team"] == self.to_mp(abbr))].sort_values("games_played", ascending=False)
 
-    def get_goalie(self, abbr, goalie_name=None):
+    def get_goalie(self, abbr, goalie_name=None, goalie_id=None):
         """#1 starter (most GP) regresses to 0.00 GSAx/60 over 15 games;
-        backups regress to -0.18 over 20 games, then a -0.10 drag."""
+        backups regress to -0.18 over 20 games, then a -0.10 drag.
+        goalie_name (manual override) wins over goalie_id (NHL-confirmed starter)."""
         team_g = self.team_goalies(abbr)
         if team_g.empty:
-            return {"name": "Unknown", "label": "Unknown", "adj60": 0.0, "is_backup": False}
+            return {"name": "Unknown", "label": "Unknown", "adj60": 0.0, "is_backup": False, "source": "projected"}
         starter = team_g.iloc[0]["name"]
-        target = goalie_name if goalie_name in team_g["name"].values else starter
+        source = "projected"
+        target = starter
+        if goalie_name in team_g["name"].values:
+            target, source = goalie_name, "override"
+        elif goalie_id is not None and "playerId" in team_g.columns and goalie_id in team_g["playerId"].values:
+            target, source = team_g[team_g["playerId"] == goalie_id].iloc[0]["name"], "confirmed"
         g = team_g[team_g["name"] == target].iloc[0]
         gp = int(g["games_played"])
         toi = max(g["icetime"] / 3600.0, 0.1)
@@ -206,7 +323,7 @@ class Model:
             adj60 = ((raw60 * toi) + (-0.18 * 20.0)) / (toi + 20.0) - 0.10
         else:
             adj60 = (raw60 * toi) / (toi + 15.0)
-        return {"name": target, "label": f"{target} ({gp} GP)", "adj60": adj60, "is_backup": is_backup}
+        return {"name": target, "label": f"{target} ({gp} GP)", "adj60": adj60, "is_backup": is_backup, "source": source}
 
     # -- Game simulation ----------------------------------------------------
     def simulate_game(self, aa, ha, ag, hg, seed=42):
@@ -310,8 +427,8 @@ def slate_card(g, sim, ag, hg):
     tag = pace_tag(a["cf60"] + h["cf60"], sim["proj_tot"])
     a_b = B2B_BADGE if sim["a_b2b"] else ""
     h_b = B2B_BADGE if sim["h_b2b"] else ""
-    ag_b = BACKUP_BADGE if ag["is_backup"] else ""
-    hg_b = BACKUP_BADGE if hg["is_backup"] else ""
+    ag_b = goalie_badges(ag)
+    hg_b = goalie_badges(hg)
     return f"""
     <div class='card'>
       <div class='card-head'>
@@ -549,58 +666,140 @@ with st.expander("🥅 Goalie overrides"):
     if overrides:
         st.caption("Active: " + ", ".join(f"{t}: {n}" for t, n in sorted(overrides.items())))
 
-tab_slate, tab_props, tab_live = st.tabs(["Slate", "Player Props", "Live Tracker"])
+# Box scores for games at or past warmups: confirmed starting goalies and dressed lineups.
+boxes = {}
+for g in games:
+    if g["state"] != "FUT":
+        try:
+            boxes[g["id"]] = load_boxscore(g["id"])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def resolve_goalie(g, side, use_override=True):
+    """Manual override > NHL-confirmed starter > projected #1 (most GP)."""
+    abbr = g[side]
+    box_side = "awayTeam" if side == "away" else "homeTeam"
+    return model.get_goalie(
+        abbr,
+        overrides.get(abbr) if use_override else None,
+        starter_goalie_id(boxes.get(g["id"]), box_side),
+    )
+
+
+tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Slate", "Player Props", "Live Tracker", "Record"])
 
 with tab_slate:
     cards = []
     for g in games:
         try:
-            ag = model.get_goalie(g["away"], overrides.get(g["away"]))
-            hg = model.get_goalie(g["home"], overrides.get(g["home"]))
+            ag, hg = resolve_goalie(g, "away"), resolve_goalie(g, "home")
             sim = model.simulate_game(g["away"], g["home"], ag, hg)
             cards.append(slate_card(g, sim, ag, hg))
         except Exception as exc:  # noqa: BLE001
             cards.append(f"<div class='card'>{g['away']} @ {g['home']}: could not simulate ({exc})</div>")
     st.markdown("".join(cards), unsafe_allow_html=True)
 
+def project_game(g):
+    """Goalies and skater projections for one game, using the best available lineup."""
+    aa, ha = g["away"], g["home"]
+    box = boxes.get(g["id"])
+    a_ids, h_ids = dressed_ids(box, "awayTeam") if box else None, dressed_ids(box, "homeTeam") if box else None
+    lineup_src = "tonight's dressed lineups" if (a_ids and h_ids) else "current NHL rosters"
+    a_ids = a_ids or load_roster(aa)
+    h_ids = h_ids or load_roster(ha)
+    if not (a_ids and h_ids):
+        lineup_src = "MoneyPuck season data (roster unavailable)"
+    ag, hg = resolve_goalie(g, "away"), resolve_goalie(g, "home")
+    df_a = model.project_skaters(aa, ha, False, hg["adj60"], player_ids=a_ids)
+    df_h = model.project_skaters(ha, aa, True, ag["adj60"], player_ids=h_ids)
+    return ag, hg, df_a, df_h, lineup_src
+
+
 with tab_props:
+    # -- Player search + prop line checker --------------------------------
+    st.markdown("<div class='section'>🔎 Player search & line check</div>", unsafe_allow_html=True)
+    index = []
+    for g in games:
+        try:
+            ag, hg, df_a, df_h, _ = project_game(g)
+        except Exception:  # noqa: BLE001
+            continue
+        for df, team, opp, opp_g in ((df_a, g["away"], g["home"], hg), (df_h, g["home"], g["away"], ag)):
+            for _, r in df.iterrows():
+                index.append({**r.to_dict(), "team": team, "opp": opp, "opp_goalie": opp_g, "time": g["time"]})
+    index.sort(key=lambda r: r["name"])
+    labels_ix = [f"{r['name']} ({r['team']} vs {r['opp']})" for r in index]
+    sel = st.selectbox("Player", labels_ix, index=None, placeholder="Type a name: anyone playing tonight", key="search_player")
+    if sel:
+        r = index[labels_ix.index(sel)]
+        st.markdown(
+            props_card(f"{r['name']} · {r['team']} vs {r['opp']} ({r['time']}) · opp G {r['opp_goalie']['name']}{goalie_badges(r['opp_goalie'])}",
+                       pd.DataFrame([r])),
+            unsafe_allow_html=True,
+        )
+        markets = {"Shots on Goal": ("sog", 2.5), "Points": ("pts", 0.5), "Goals": ("xg", 0.5)}
+        c1, c2 = st.columns(2)
+        market = c1.selectbox("Market", list(markets), key="lc_market")
+        key, default_line = markets[market]
+        line = c2.number_input("Line", min_value=0.0, max_value=15.0, value=default_line, step=0.5, key=f"lc_line_{key}")
+        c3, c4 = st.columns(2)
+        o_odds = c3.number_input("Over odds (American)", value=-110, step=5, key="lc_over")
+        u_odds = c4.number_input("Under odds (American)", value=-110, step=5, key="lc_under")
+
+        lam = float(r[key])
+        p_over, p_under, p_push = line_probs(lam, line)
+        imp_o, imp_u = american_to_prob(o_odds), american_to_prob(u_odds)
+        if imp_o and imp_u:
+            vig = imp_o + imp_u
+            imp_o, imp_u = imp_o / vig, imp_u / vig
+        # Edge vs. no-vig market, using probabilities that exclude pushes.
+        settled = max(p_over + p_under, 1e-9)
+        m_o, m_u = p_over / settled, p_under / settled
+        edge_o = (m_o - imp_o) * 100 if imp_o else None
+        edge_u = (m_u - imp_u) * 100 if imp_u else None
+
+        def edge_cell(e):
+            if e is None:
+                return "—"
+            color = "#86efac" if e >= 3 else ("#fca5a5" if e <= -3 else "#cbd5e1")
+            return f"<b style='color:{color}'>{e:+.1f}%</b>"
+
+        push_txt = f" · Push {p_push*100:.0f}%" if p_push > 0 else ""
+        st.markdown(
+            f"""
+            <div class='card'>
+              <div class='section'>{market} {line:g} · model mean {lam:.2f}{push_txt}</div>
+              <div class='tbl-wrap'><table class='tbl'>
+                <tr><th>Side</th><th>Model %</th><th>Fair odds</th><th>Market (no-vig)</th><th>Edge</th></tr>
+                <tr><td><b>Over</b></td><td>{p_over*100:.1f}%</td><td>{prob_to_american(m_o)}</td><td>{f"{imp_o*100:.1f}%" if imp_o else "—"}</td><td>{edge_cell(edge_o)}</td></tr>
+                <tr><td><b>Under</b></td><td>{p_under*100:.1f}%</td><td>{prob_to_american(m_u)}</td><td>{f"{imp_u*100:.1f}%" if imp_u else "—"}</td><td>{edge_cell(edge_u)}</td></tr>
+              </table></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Model % assumes a Poisson count around the projected mean. Edge is the model's chance minus the market's no-vig chance; green ≥ +3%.")
+
+    st.divider()
+
+    # -- Full matchup board ------------------------------------------------
     labels = [f"{g['away']} @ {g['home']} ({g['time']})" for g in games]
     pick = st.selectbox("Matchup", labels, key="props_game")
     g = games[labels.index(pick)]
     aa, ha = g["away"], g["home"]
     show = st.radio("Show", ["All", "Top 8", "Top 12"], horizontal=True, key="props_show")
     try:
-        # Lineup: dressed skaters once the game has started, otherwise the current NHL roster.
-        a_ids = h_ids = None
-        lineup_src = "current NHL rosters"
-        if g["state"] not in ("FUT", "PRE"):
-            try:
-                box = load_boxscore(g["id"])
-                a_ids, h_ids = dressed_ids(box, "awayTeam"), dressed_ids(box, "homeTeam")
-                if a_ids and h_ids:
-                    lineup_src = "tonight's dressed lineups"
-            except Exception:  # noqa: BLE001
-                pass
-        a_ids = a_ids or load_roster(aa)
-        h_ids = h_ids or load_roster(ha)
-        if not (a_ids and h_ids):
-            lineup_src = "MoneyPuck season data (roster unavailable)"
-
-        ag = model.get_goalie(aa, overrides.get(aa))
-        hg = model.get_goalie(ha, overrides.get(ha))
-        df_a = model.project_skaters(aa, ha, False, hg["adj60"], player_ids=a_ids)
-        df_h = model.project_skaters(ha, aa, True, ag["adj60"], player_ids=h_ids)
+        ag, hg, df_a, df_h, lineup_src = project_game(g)
         if show != "All":
             n = int(show.split()[1])
             df_a, df_h = df_a.head(n), df_h.head(n)
         st.caption(f"{len(df_a)} {aa} and {len(df_h)} {ha} skaters, from {lineup_src}. Sorted by projected points.")
-        hg_b = BACKUP_BADGE if hg["is_backup"] else ""
-        ag_b = BACKUP_BADGE if ag["is_backup"] else ""
         a_b = B2B_BADGE if aa in b2b_teams else ""
         h_b = B2B_BADGE if ha in b2b_teams else ""
         st.markdown(
-            props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{hg_b})", df_a)
-            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{ag_b})", df_h),
+            props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a)
+            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h),
             unsafe_allow_html=True,
         )
     except Exception as exc:  # noqa: BLE001
@@ -616,7 +815,7 @@ with tab_live:
         if c2.button("Refresh", use_container_width=True, key="live_refresh"):
             load_boxscore.clear()
 
-        # Backtest uses each team's #1 starter (no overrides) and no player B2B, as in the notebook.
+        # Uses the NHL-confirmed starter when known (no manual overrides) and no player B2B, as in the notebook.
         entries = []
         for g in games:
             box = None
@@ -625,13 +824,15 @@ with tab_live:
                     box = load_boxscore(g["id"])
                 except Exception:  # noqa: BLE001
                     box = None
+            if box:
+                boxes[g["id"]] = box
             entries.append((g, box, game_status(g, box)))
         entries.sort(key=lambda e: (STATUS_ORDER[e[2]["kind"]], games.index(e[0])))
 
         for g, box, status in entries:
             aa, ha = g["away"], g["home"]
             try:
-                ag, hg = model.get_goalie(aa), model.get_goalie(ha)
+                ag, hg = resolve_goalie(g, "away", use_override=False), resolve_goalie(g, "home", use_override=False)
                 sim = model.simulate_game(aa, ha, ag, hg)
                 st.markdown(live_card(g, box, status, sim), unsafe_allow_html=True)
                 if box and status["kind"] != "sched":
@@ -644,6 +845,67 @@ with tab_live:
                 st.error(f"Could not load {aa} @ {ha}: {exc}")
 
     live_tracker()
+
+with tab_rec:
+    end_d = min(slate_date, est_now.date()) - datetime.timedelta(days=1)
+    if end_d < SEASON_START:
+        st.info("No completed games yet this season.")
+    else:
+        try:
+            rec = season_record(SEASON, SEASON_START.isoformat(), end_d.isoformat())
+        except Exception as exc:  # noqa: BLE001
+            rec = pd.DataFrame()
+            st.error(f"Could not build the season record: {exc}")
+        if rec.empty:
+            st.info("No completed games found.")
+        else:
+            wins = int(rec["hit"].sum())
+            c1, c2 = st.columns(2)
+            c1.metric("Winner picks", f"{wins}-{len(rec) - wins}", f"{rec['hit'].mean()*100:.1f}% hit rate", delta_color="off")
+            c2.metric("Total goals error", f"{rec['tot_err'].abs().mean():.2f} per game",
+                      f"bias {rec['tot_err'].mean():+.2f} (actual − proj)", delta_color="off")
+            c3, c4 = st.columns(2)
+            c3.metric("O/U 5.5 calls", f"{rec['o55_hit'].mean()*100:.1f}%", f"{len(rec)} games", delta_color="off")
+            team_err = pd.concat([(rec["a_goals"] - rec["proj_a"]).abs(), (rec["h_goals"] - rec["proj_h"]).abs()]).mean()
+            c4.metric("Team goals error", f"{team_err:.2f} per team", f"avg proj total {rec['proj_tot'].mean():.2f}", delta_color="off")
+
+            bins = [(0.5, 0.55, "50–55%"), (0.55, 0.60, "55–60%"), (0.60, 0.65, "60–65%"), (0.65, 1.01, "65%+")]
+            conf_rows = ""
+            for lo, hi, lab in bins:
+                sub = rec[(rec["pick_p"] >= lo) & (rec["pick_p"] < hi)]
+                if len(sub):
+                    conf_rows += f"<tr><td>{lab}</td><td>{len(sub)}</td><td>{sub['pick_p'].mean()*100:.0f}%</td><td><b>{sub['hit'].mean()*100:.0f}%</b></td></tr>"
+            last7 = rec[rec["date"] > (end_d - datetime.timedelta(days=7)).isoformat()]
+            l7 = f"{int(last7['hit'].sum())}-{len(last7) - int(last7['hit'].sum())}" if len(last7) else "—"
+            recent = ""
+            for _, r in rec.sort_values(["date"], ascending=False).head(20).iterrows():
+                sfx = "" if r["last"] == "REG" else f" ({r['last']})"
+                recent += (
+                    f"<tr><td>{r['date'][5:]}</td><td>{r['away']} @ {r['home']}</td>"
+                    f"<td>{r['proj_a']:.1f}–{r['proj_h']:.1f}</td><td><b>{r['a_goals']}–{r['h_goals']}</b>{sfx}</td>"
+                    f"<td>{r['pick']} {'✅' if r['hit'] else '❌'}</td></tr>"
+                )
+            st.markdown(
+                f"""
+                <div class='card'>
+                  <div class='section'>By confidence · last 7 days {l7}</div>
+                  <div class='tbl-wrap'><table class='tbl'>
+                    <tr><th>Pick win %</th><th>Games</th><th>Avg model %</th><th>Hit rate</th></tr>{conf_rows}
+                  </table></div>
+                </div>
+                <div class='card'>
+                  <div class='section'>Recent results</div>
+                  <div class='tbl-wrap'><table class='tbl'>
+                    <tr><th>Date</th><th>Game</th><th>Proj</th><th>Final</th><th>Pick</th></tr>{recent}
+                  </table></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "Graded with today's season-to-date MoneyPuck stats and each team's #1 goalie, so earlier games are "
+                "partly in-sample and this record runs a bit optimistic. Shootout wins count for the winner."
+            )
 
 st.caption(
     f"MoneyPuck {SEASON} season summary · NHL API schedule & box scores · "
