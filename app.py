@@ -31,7 +31,14 @@ MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
 
 st.set_page_config(page_title="NHL Game Flow Model", page_icon="🏒", layout="centered")
 
-st.markdown(
+
+def st_html(content):
+    """Render HTML via st.markdown. Lines are left-stripped and blank lines dropped so Markdown
+    never treats indented HTML as a code block (which shows raw tags)."""
+    lines = [ln.strip() for ln in str(content).splitlines()]
+    st.markdown("\n".join(ln for ln in lines if ln), unsafe_allow_html=True)
+
+st_html(
     """
     <style>
       .block-container {padding-top: 1.2rem; padding-left: 0.8rem; padding-right: 0.8rem;}
@@ -62,9 +69,7 @@ st.markdown(
       .dot.sched {background:#64748b;}
       @keyframes pulse {0% {box-shadow:0 0 0 0 rgba(34,197,94,.7);} 70% {box-shadow:0 0 0 7px rgba(34,197,94,0);} 100% {box-shadow:0 0 0 0 rgba(34,197,94,0);}}
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """)
 
 B2B_BADGE = " <span class='badge b2b'>B2B</span>"
 BACKUP_BADGE = " <span class='badge backup'>BACKUP</span>"
@@ -526,11 +531,9 @@ games = games_on(sched, date_str)
 b2b_teams = teams_played_on(sched_prev, prev_str)
 model = Model(teams_df, goalies_df, skaters_df, b2b_teams)
 
-st.markdown(
+st_html(
     f"<div class='meta'>📅 <b>{date_str}</b> ({len(games)} games) &nbsp;|&nbsp; "
-    f"Auto-B2B: <b>{', '.join(sorted(b2b_teams)) if b2b_teams else 'None'}</b></div>",
-    unsafe_allow_html=True,
-)
+    f"Auto-B2B: <b>{', '.join(sorted(b2b_teams)) if b2b_teams else 'None'}</b></div>")
 
 if not games:
     st.info("No games scheduled for this date.")
@@ -570,7 +573,7 @@ with tab_slate:
             cards.append(slate_card(g, sim, ag, hg))
         except Exception as exc:  # noqa: BLE001
             cards.append(f"<div class='card'>{g['away']} @ {g['home']}: could not simulate ({exc})</div>")
-    st.markdown("".join(cards), unsafe_allow_html=True)
+    st_html("".join(cards))
 
 with tab_props:
     labels = [f"{g['away']} @ {g['home']} ({g['time']})" for g in games]
@@ -607,11 +610,9 @@ with tab_props:
         ag_b = BACKUP_BADGE if ag["is_backup"] else ""
         a_b = B2B_BADGE if aa in b2b_teams else ""
         h_b = B2B_BADGE if ha in b2b_teams else ""
-        st.markdown(
+        st_html(
             props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{hg_b})", df_a)
-            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{ag_b})", df_h),
-            unsafe_allow_html=True,
-        )
+            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{ag_b})", df_h))
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not project {aa} @ {ha}: {exc}")
 
@@ -674,13 +675,13 @@ with tab_live:
             try:
                 ag, hg = model.get_goalie(aa), model.get_goalie(ha)
                 sim = model.simulate_game(aa, ha, ag, hg)
-                st.markdown(live_card(g, box, status, sim), unsafe_allow_html=True)
+                st_html(live_card(g, box, status, sim))
                 if box and status["kind"] != "sched":
                     actual = parse_box_players(box)
                     a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
                     h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
                     with st.expander(f"{aa} @ {ha} skaters: proj vs actual"):
-                        st.markdown(skater_compare_card(aa, a_df, ha, h_df, actual), unsafe_allow_html=True)
+                        st_html(skater_compare_card(aa, a_df, ha, h_df, actual))
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Could not load {aa} @ {ha}: {exc}")
 
