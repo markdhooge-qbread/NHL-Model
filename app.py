@@ -3,7 +3,7 @@
 Streamlit port of notebooks/player_model.ipynb:
   1. Slate Sim   - 10,000-iteration Gamma-Poisson Monte Carlo per game
   2. Player Props - SOG, anytime goal %, and 1+ point % for top skaters
-  3. Backtest    - model projection vs. live/final NHL API box score
+  3. Live Tracker - every game's status, period/clock, and model vs. live/final box score
 """
 
 import datetime
@@ -56,6 +56,11 @@ st.markdown(
       .bal {background:#334155;color:#cbd5e1;}
       .section {font-size:13px;font-weight:800;color:#38bdf8;margin:4px 0;}
       .meta {color:#94a3b8;font-size:12px;margin-bottom:8px;}
+      .dot {display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;vertical-align:middle;}
+      .dot.live {background:#22c55e;box-shadow:0 0 0 0 rgba(34,197,94,.7);animation:pulse 1.6s infinite;}
+      .dot.final {background:#ef4444;}
+      .dot.sched {background:#64748b;}
+      @keyframes pulse {0% {box-shadow:0 0 0 0 rgba(34,197,94,.7);} 70% {box-shadow:0 0 0 7px rgba(34,197,94,0);} 100% {box-shadow:0 0 0 0 rgba(34,197,94,0);}}
     </style>
     """,
     unsafe_allow_html=True,
@@ -87,7 +92,7 @@ def load_schedule(date_str):
     return resp.json()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def load_boxscore(game_id):
     resp = requests.get(f"{NHL_API}/gamecenter/{game_id}/boxscore", timeout=15)
     resp.raise_for_status()
@@ -376,6 +381,120 @@ def backtest_rows(df, actual):
     return html
 
 
+LIVE_STATES = ("LIVE", "CRIT")
+FINAL_STATES = ("FINAL", "OFF")
+STATUS_ORDER = {"live": 0, "sched": 1, "final": 2}
+
+
+def _ordinal(n):
+    return {1: "1st", 2: "2nd", 3: "3rd"}.get(n, f"{n}th")
+
+
+def _period_label(pdesc):
+    num = pdesc.get("number") or 0
+    ptype = pdesc.get("periodType", "REG")
+    if ptype == "SO":
+        return "SO"
+    if ptype == "OT" or num > 3:
+        n_ot = max(num - 3, 1)
+        return "OT" if n_ot == 1 else f"{n_ot}OT"
+    return f"P{num}" if num else ""
+
+
+def game_status(g, box):
+    """Status dot kind ('live'/'final'/'sched') and display text, e.g. 'P2 · 12:34'."""
+    box = box or {}
+    state = box.get("gameState", g["state"])
+    pdesc = box.get("periodDescriptor", {}) or {}
+    clock = box.get("clock", {}) or {}
+    if state in LIVE_STATES:
+        if clock.get("inIntermission"):
+            num = pdesc.get("number") or 0
+            text = f"{_ordinal(num)} INT" + (f" · {clock.get('timeRemaining')}" if clock.get("timeRemaining") else "")
+        else:
+            label = _period_label(pdesc)
+            text = f"{label} · {clock.get('timeRemaining', '')}".strip(" ·") if label != "SO" else "Shootout"
+        return {"kind": "live", "label": "LIVE", "text": text, "state": state}
+    if state in FINAL_STATES:
+        label = _period_label(pdesc)
+        suffix = f"/{label}" if label in ("SO",) or "OT" in label else ""
+        return {"kind": "final", "label": f"FINAL{suffix}", "text": "", "state": state}
+    return {"kind": "sched", "label": g["time"], "text": "", "state": state}
+
+
+def live_card(g, box, status, sim):
+    aa, ha = g["away"], g["home"]
+    box = box or {}
+    started = status["kind"] != "sched"
+    act_a = (box.get("awayTeam", {}).get("score") or 0) if started else None
+    act_h = (box.get("homeTeam", {}).get("score") or 0) if started else None
+    sog_a = box.get("awayTeam", {}).get("sog") or 0
+    sog_h = box.get("homeTeam", {}).get("sog") or 0
+
+    dot = f"<span class='dot {status['kind']}'></span>"
+    status_txt = f"<b>{status['label']}</b>" + (f" <span class='card-sub'>{status['text']}</span>" if status["text"] else "")
+    a_b = B2B_BADGE if sim["a_b2b"] else ""
+    h_b = B2B_BADGE if sim["h_b2b"] else ""
+
+    pred_w = aa if sim["proj_a"] > sim["proj_h"] else ha
+    if status["kind"] == "final":
+        act_w = aa if act_a > act_h else (ha if act_h > act_a else "TIE")
+        call = "✅ HIT" if pred_w == act_w else "❌ MISS"
+    elif status["kind"] == "live":
+        leader = aa if act_a > act_h else (ha if act_h > act_a else None)
+        call = "⏳ TIED" if leader is None else ("⏳ ON TRACK" if leader == pred_w else "⏳ TRAILING")
+    else:
+        call = "🕒 PREGAME"
+
+    if started:
+        act_tot = act_a + act_h
+        score = f"{aa}{a_b} <b>{act_a}</b> — <b>{act_h}</b> {ha}{h_b}"
+        table = f"""
+          <div class='tbl-wrap'><table class='tbl' style='font-size:13px;'>
+            <tr><th>Metric</th><th>Proj</th><th>Actual</th><th>Diff</th></tr>
+            <tr><td><b>{aa} Goals</b></td><td>{sim['proj_a']:.2f}</td><td><b>{act_a}</b></td><td>{act_a - sim['proj_a']:+.2f}</td></tr>
+            <tr><td><b>{ha} Goals</b></td><td>{sim['proj_h']:.2f}</td><td><b>{act_h}</b></td><td>{act_h - sim['proj_h']:+.2f}</td></tr>
+            <tr><td><b>Total Goals</b></td><td>{sim['proj_tot']:.2f}</td><td><b>{act_tot}</b></td><td>{act_tot - sim['proj_tot']:+.2f}</td></tr>
+            <tr><td><b>Shots on Goal</b></td><td>Pace {sim['a']['ca60']:.0f} / {sim['h']['ca60']:.0f}</td><td><b>{sog_a} — {sog_h}</b></td><td>{ha} {sog_h - sog_a:+d}</td></tr>
+          </table></div>"""
+    else:
+        score = f"{aa}{a_b} @ {ha}{h_b}"
+        table = f"""
+          <div class='summary'>
+            <div><b>Proj:</b> {aa} {sim['proj_a']:.2f} — {ha} {sim['proj_h']:.2f}</div>
+            <div><b>Win:</b> {aa} {sim['a_win']*100:.0f}% | {ha} {sim['h_win']*100:.0f}%</div>
+            <div><b>Tot:</b> {sim['proj_tot']:.2f}</div>
+          </div>"""
+    return f"""
+    <div class='card' style='margin-bottom:4px;'>
+      <div class='card-head'>
+        <div style='font-size:12px;'>{dot}{status_txt}</div>
+        <div class='badge bal' style='font-size:11px;'>Model pick {pred_w}: {call}</div>
+      </div>
+      <div class='card-title' style='margin-bottom:8px;'>{score}</div>
+      {table}
+    </div>
+    """
+
+
+def skater_compare_card(aa, a_df, ha, h_df, actual):
+    empty = "<tr><td colspan='3'>No box score yet</td></tr>"
+    a_rows = backtest_rows(a_df, actual) or empty
+    h_rows = backtest_rows(h_df, actual) or empty
+    return f"""
+    <div class='card'>
+      <div class='section'>{aa} Skaters (Proj vs Actual)</div>
+      <div class='tbl-wrap'><table class='tbl' style='margin-bottom:10px;'>
+        <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{a_rows}
+      </table></div>
+      <div class='section'>{ha} Skaters (Proj vs Actual)</div>
+      <div class='tbl-wrap'><table class='tbl'>
+        <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{h_rows}
+      </table></div>
+    </div>
+    """
+
+
 # ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
@@ -430,7 +549,7 @@ with st.expander("🥅 Goalie overrides"):
     if overrides:
         st.caption("Active: " + ", ".join(f"{t}: {n}" for t, n in sorted(overrides.items())))
 
-tab_slate, tab_props, tab_bt = st.tabs(["Slate", "Player Props", "Backtest"])
+tab_slate, tab_props, tab_live = st.tabs(["Slate", "Player Props", "Live Tracker"])
 
 with tab_slate:
     cards = []
@@ -487,69 +606,44 @@ with tab_props:
     except Exception as exc:  # noqa: BLE001
         st.error(f"Could not project {aa} @ {ha}: {exc}")
 
-with tab_bt:
-    bt_labels = [f"{g['away']} @ {g['home']} [{g['state']}]" for g in games]
-    c1, c2 = st.columns([3, 1])
-    bt_pick = c1.selectbox("Test game", bt_labels, key="bt_game")
-    if c2.button("Refresh box score", use_container_width=True):
-        load_boxscore.clear()
-    g = games[bt_labels.index(bt_pick)]
-    aa, ha, gid = g["away"], g["home"], g["id"]
-    try:
-        box = load_boxscore(gid)
-        state = box.get("gameState", g["state"])
-        act_a = box.get("awayTeam", {}).get("score", 0) or 0
-        act_h = box.get("homeTeam", {}).get("score", 0) or 0
-        act_a_sog = box.get("awayTeam", {}).get("sog", 0) or 0
-        act_h_sog = box.get("homeTeam", {}).get("sog", 0) or 0
+with tab_live:
+    any_live = any(g["state"] in LIVE_STATES for g in games)
+
+    @st.fragment(run_every=60 if any_live else None)
+    def live_tracker():
+        c1, c2 = st.columns([3, 1])
+        c1.caption("Auto-refreshes every 60s while games are live." if any_live else "Projection vs. live/final box score.")
+        if c2.button("Refresh", use_container_width=True, key="live_refresh"):
+            load_boxscore.clear()
 
         # Backtest uses each team's #1 starter (no overrides) and no player B2B, as in the notebook.
-        ag = model.get_goalie(aa)
-        hg = model.get_goalie(ha)
-        sim = model.simulate_game(aa, ha, ag, hg)
-        act_tot = act_a + act_h
-        pred_w = aa if sim["proj_a"] > sim["proj_h"] else ha
-        act_w = aa if act_a > act_h else (ha if act_h > act_a else "TIE")
-        if state not in ("FINAL", "OFF"):
-            hit = "⏳ LIVE" if state in ("LIVE", "CRIT") else "🕒 NOT STARTED"
-        else:
-            hit = "✅ HIT" if pred_w == act_w else "❌ MISS"
+        entries = []
+        for g in games:
+            box = None
+            if g["state"] not in ("FUT", "PRE"):
+                try:
+                    box = load_boxscore(g["id"])
+                except Exception:  # noqa: BLE001
+                    box = None
+            entries.append((g, box, game_status(g, box)))
+        entries.sort(key=lambda e: (STATUS_ORDER[e[2]["kind"]], games.index(e[0])))
 
-        actual = parse_box_players(box)
-        a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
-        h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
-        a_rows = backtest_rows(a_df, actual) or "<tr><td colspan='3'>No box score yet</td></tr>"
-        h_rows = backtest_rows(h_df, actual) or "<tr><td colspan='3'>No box score yet</td></tr>"
-        sog_diff = act_h_sog - act_a_sog
+        for g, box, status in entries:
+            aa, ha = g["away"], g["home"]
+            try:
+                ag, hg = model.get_goalie(aa), model.get_goalie(ha)
+                sim = model.simulate_game(aa, ha, ag, hg)
+                st.markdown(live_card(g, box, status, sim), unsafe_allow_html=True)
+                if box and status["kind"] != "sched":
+                    actual = parse_box_players(box)
+                    a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
+                    h_df = model.project_skaters(ha, aa, True, ag["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "homeTeam"))
+                    with st.expander(f"{aa} @ {ha} skaters: proj vs actual"):
+                        st.markdown(skater_compare_card(aa, a_df, ha, h_df, actual), unsafe_allow_html=True)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not load {aa} @ {ha}: {exc}")
 
-        st.markdown(
-            f"""
-            <div class='card'>
-              <div class='card-head'>
-                <div class='card-title'>BACKTEST: {aa} @ {ha} <span class='card-sub'>({state})</span></div>
-                <div class='badge bal' style='font-size:12px;'>Winner call: {hit}</div>
-              </div>
-              <div class='tbl-wrap'><table class='tbl' style='font-size:13px;margin-bottom:10px;'>
-                <tr><th>Metric</th><th>Proj</th><th>Actual</th><th>Diff</th></tr>
-                <tr><td><b>{aa} Goals</b></td><td>{sim['proj_a']:.2f}</td><td><b>{act_a}</b></td><td>{act_a - sim['proj_a']:+.2f}</td></tr>
-                <tr><td><b>{ha} Goals</b></td><td>{sim['proj_h']:.2f}</td><td><b>{act_h}</b></td><td>{act_h - sim['proj_h']:+.2f}</td></tr>
-                <tr><td><b>Total Goals</b></td><td>{sim['proj_tot']:.2f}</td><td><b>{act_tot}</b></td><td>{act_tot - sim['proj_tot']:+.2f}</td></tr>
-                <tr><td><b>Shots on Goal</b></td><td>Pace {sim['a']['ca60']:.0f} / {sim['h']['ca60']:.0f}</td><td><b>{act_a_sog} — {act_h_sog}</b></td><td>{ha} {sog_diff:+d}</td></tr>
-              </table></div>
-              <div class='section'>{aa} Skaters (Proj vs Actual)</div>
-              <div class='tbl-wrap'><table class='tbl' style='margin-bottom:10px;'>
-                <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{a_rows}
-              </table></div>
-              <div class='section'>{ha} Skaters (Proj vs Actual)</div>
-              <div class='tbl-wrap'><table class='tbl'>
-                <tr><th>Player</th><th>SOG</th><th>Points</th></tr>{h_rows}
-              </table></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not run backtest for {aa} @ {ha}: {exc}")
+    live_tracker()
 
 st.caption(
     f"MoneyPuck {SEASON} season summary · NHL API schedule & box scores · "
