@@ -31,6 +31,7 @@ MP_BASE = "https://moneypuck.com/moneypuck/playerData/seasonSummary"
 NHL_API = "https://api-web.nhle.com/v1"
 MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
 SEASON_START = datetime.date(SEASON, 10, 1)
+DK_NHL_URL = "https://sportsbook.draftkings.com/leagues/hockey/nhl"
 
 st.set_page_config(page_title="NHL Game Flow Model", page_icon="🏒", layout="centered")
 
@@ -485,6 +486,72 @@ def props_card(title, df):
     """
 
 
+def ranked_card(title, rows_df):
+    rows = "".join(
+        f"<tr><td>{i}</td>"
+        f"<td><b>{r['name']}</b> <span class='card-sub'>({r['pos']}) {r['team']} vs {r['opp']}</span>"
+        f"{SMALL_SAMPLE_BADGE if r['gp'] < 5 else ''}</td>"
+        f"<td><b>{r['sog']:.2f}</b></td>"
+        f"<td>{r['xg']:.2f} ({r['atg']:.0f}%)</td>"
+        f"<td><b>{r['pts']:.2f}</b> ({r['pt_p']:.0f}%)</td></tr>"
+        for i, (_, r) in enumerate(rows_df.iterrows(), start=1)
+    )
+    return f"""
+    <div class='card'>
+      <div class='section'>{title}</div>
+      <div class='tbl-wrap'><table class='tbl'>
+        <tr><th>#</th><th>Player</th><th>SOG</th><th>xG (ATG%)</th><th>Pts (1+%)</th></tr>{rows}
+      </table></div>
+    </div>
+    """
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_final_boxscore(game_id):
+    """Box score for a finished game (cached for a day, since it no longer changes)."""
+    resp = requests.get(f"{NHL_API}/gamecenter/{game_id}/boxscore", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@st.cache_data(ttl=21600, show_spinner="Grading that slate's top projected players...")
+def daily_top_players(season, date_str, top_n=50):
+    """Top-N projected-points skaters on a past slate, with their actual box score lines."""
+    teams_df, goalies_df, skaters_df = load_moneypuck(season)
+    day = datetime.date.fromisoformat(date_str)
+    prev = (day - datetime.timedelta(days=1)).isoformat()
+    day_games = [g for g in games_on(load_schedule(date_str), date_str)]
+    m = Model(teams_df, goalies_df, skaters_df, teams_played_on(load_schedule(prev), prev))
+    rows = []
+    for g in day_games:
+        try:
+            box = load_final_boxscore(g["id"])
+        except Exception:  # noqa: BLE001
+            continue
+        if box.get("gameState") not in ("FINAL", "OFF"):
+            continue
+        actual = parse_box_players(box)
+        aa, ha = g["away"], g["home"]
+        try:
+            ag = m.get_goalie(aa, goalie_id=starter_goalie_id(box, "awayTeam"))
+            hg = m.get_goalie(ha, goalie_id=starter_goalie_id(box, "homeTeam"))
+            df_a = m.project_skaters(aa, ha, False, hg["adj60"], player_ids=dressed_ids(box, "awayTeam"))
+            df_h = m.project_skaters(ha, aa, True, ag["adj60"], player_ids=dressed_ids(box, "homeTeam"))
+        except Exception:  # noqa: BLE001
+            continue
+        for df, team, opp in ((df_a, aa, ha), (df_h, ha, aa)):
+            for _, r in df.iterrows():
+                act = actual.get(r["playerId"])
+                if act is None:
+                    continue
+                rows.append({**{k: r[k] for k in ("name", "pos", "sog", "xg", "atg", "pts", "pt_p")},
+                             "team": team, "opp": opp, "act_pts": act["pts"], "act_g": act["g"],
+                             "act_a": act["a"], "act_sog": act["sog"]})
+    cols = ["name", "pos", "team", "opp", "sog", "xg", "atg", "pts", "pt_p", "act_pts", "act_g", "act_a", "act_sog"]
+    df = pd.DataFrame(rows, columns=cols)
+    return df.sort_values("pts", ascending=False).head(top_n).reset_index(drop=True)
+
+
 def parse_box_players(box):
     out = {}
     stats = box.get("playerByGameStats", {})
@@ -809,28 +876,46 @@ with tab_props:
             </div>
             """)
         st.caption("Model % assumes a Poisson count around the projected mean. Edge is the model's chance minus the market's no-vig chance; green ≥ +3%.")
+        st.link_button("Open NHL player props on DraftKings ↗", DK_NHL_URL, use_container_width=True)
 
     st.divider()
 
-    # -- Full matchup board ------------------------------------------------
-    labels = [f"{g['away']} @ {g['home']} ({g['time']})" for g in games]
-    pick = st.selectbox("Matchup", labels, key="props_game")
-    g = games[labels.index(pick)]
-    aa, ha = g["away"], g["home"]
-    show = st.radio("Show", ["All", "Top 8", "Top 12"], horizontal=True, key="props_show")
-    try:
-        ag, hg, df_a, df_h, lineup_src = project_game(g)
-        if show != "All":
-            n = int(show.split()[1])
-            df_a, df_h = df_a.head(n), df_h.head(n)
-        st.caption(f"{len(df_a)} {aa} and {len(df_h)} {ha} skaters, from {lineup_src}. Sorted by projected points.")
-        a_b = B2B_BADGE if aa in b2b_teams else ""
-        h_b = B2B_BADGE if ha in b2b_teams else ""
-        st_html(
-            props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a)
-            + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h))
-    except Exception as exc:  # noqa: BLE001
-        st.error(f"Could not project {aa} @ {ha}: {exc}")
+    view = st.radio("View", ["All players (ranked)", "By game"], horizontal=True, key="props_view")
+
+    if view == "All players (ranked)":
+        sort_opts = {"Points": "pts", "Shots on Goal": "sog", "Goals (xG)": "xg"}
+        c1, c2 = st.columns(2)
+        sort_by = c1.selectbox("Rank by", list(sort_opts), key="rank_by")
+        top = c2.selectbox("Show", ["Top 25", "Top 50", "All"], index=1, key="rank_top")
+        ranked = pd.DataFrame(index).sort_values(sort_opts[sort_by], ascending=False) if index else pd.DataFrame()
+        if ranked.empty:
+            st.info("No skater projections available for this slate.")
+        else:
+            if top != "All":
+                ranked = ranked.head(int(top.split()[1]))
+            st.caption(f"{len(ranked)} of {len(index)} skaters across {len(games)} games, ranked by projected {sort_by.lower()}.")
+            st_html(ranked_card(f"Tonight's top projected {sort_by.lower()}", ranked))
+
+    else:
+        # -- Full matchup board --------------------------------------------
+        labels = [f"{g['away']} @ {g['home']} ({g['time']})" for g in games]
+        pick = st.selectbox("Matchup", labels, key="props_game")
+        g = games[labels.index(pick)]
+        aa, ha = g["away"], g["home"]
+        show = st.radio("Show", ["All", "Top 8", "Top 12"], horizontal=True, key="props_show")
+        try:
+            ag, hg, df_a, df_h, lineup_src = project_game(g)
+            if show != "All":
+                n = int(show.split()[1])
+                df_a, df_h = df_a.head(n), df_h.head(n)
+            st.caption(f"{len(df_a)} {aa} and {len(df_h)} {ha} skaters, from {lineup_src}. Sorted by projected points.")
+            a_b = B2B_BADGE if aa in b2b_teams else ""
+            h_b = B2B_BADGE if ha in b2b_teams else ""
+            st_html(
+                props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a)
+                + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h))
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Could not project {aa} @ {ha}: {exc}")
 
 with tab_live:
     now_et = datetime.datetime.now(EST)
@@ -906,6 +991,76 @@ with tab_live:
                 st.error(f"Could not load {aa} @ {ha}: {exc}")
 
     live_tracker()
+
+with tab_rec:
+    # -- Daily top-50 player review ---------------------------------------
+    st_html("<div class='section'>📋 Daily top 50: projected points vs. actual</div>")
+    last_done = max(min(slate_date, est_now.date()) - datetime.timedelta(days=1), SEASON_START)
+    review_d = st.date_input("Slate to review", value=last_done, max_value=last_done,
+                             min_value=SEASON_START, key="review_date")
+    try:
+        top50 = daily_top_players(SEASON, review_d.isoformat())
+    except Exception as exc:  # noqa: BLE001
+        top50 = pd.DataFrame()
+        st.error(f"Could not grade {review_d}: {exc}")
+    if top50.empty:
+        st.info(f"No completed games found for {review_d}.")
+    else:
+        hit = (top50["act_pts"] >= 1)
+        c1, c2 = st.columns(2)
+        c1.metric("1+ point hit rate", f"{hit.mean()*100:.0f}%  ({int(hit.sum())}/{len(top50)})",
+                  f"model expected {top50['pt_p'].mean():.0f}%", delta_color="off")
+        c2.metric("Points: proj vs actual", f"{top50['pts'].sum():.1f} vs {int(top50['act_pts'].sum())}",
+                  f"{top50['act_pts'].sum() - top50['pts'].sum():+.1f} total", delta_color="off")
+        c3, c4 = st.columns(2)
+        scored = (top50["act_g"] >= 1)
+        c3.metric("Scored a goal", f"{scored.mean()*100:.0f}%", f"model ATG {top50['atg'].mean():.0f}%", delta_color="off")
+        c4.metric("SOG: proj vs actual", f"{top50['sog'].mean():.2f} vs {top50['act_sog'].mean():.2f}", "per player", delta_color="off")
+        rows = "".join(
+            f"<tr><td>{i}</td><td><b>{r['name']}</b> <span class='card-sub'>{r['team']} vs {r['opp']}</span></td>"
+            f"<td>{r['pts']:.2f} ({r['pt_p']:.0f}%)</td>"
+            f"<td><b>{int(r['act_pts'])}</b> ({int(r['act_g'])}G {int(r['act_a'])}A) {'✅' if r['act_pts'] >= 1 else '❌'}</td>"
+            f"<td>{r['sog']:.1f} vs <b>{int(r['act_sog'])}</b></td></tr>"
+            for i, (_, r) in enumerate(top50.iterrows(), start=1)
+        )
+        with st.expander(f"All {len(top50)} players for {review_d:%b %-d}"):
+            st_html(f"""
+            <div class='card'><div class='tbl-wrap'><table class='tbl'>
+              <tr><th>#</th><th>Player</th><th>Proj pts (1+%)</th><th>Actual</th><th>SOG</th></tr>{rows}
+            </table></div></div>
+            """)
+
+    if st.button("Grade the last 7 slates", use_container_width=True, key="grade_week"):
+        hist = ""
+        d = last_done
+        graded = 0
+        while graded < 7 and d >= SEASON_START:
+            try:
+                day_df = daily_top_players(SEASON, d.isoformat())
+            except Exception:  # noqa: BLE001
+                day_df = pd.DataFrame()
+            if not day_df.empty:
+                h = (day_df["act_pts"] >= 1)
+                hist += (f"<tr><td>{d:%a %b %-d}</td><td>{len(day_df)}</td>"
+                         f"<td><b>{h.mean()*100:.0f}%</b></td><td>{day_df['pt_p'].mean():.0f}%</td>"
+                         f"<td>{day_df['act_pts'].sum() - day_df['pts'].sum():+.1f}</td></tr>")
+                graded += 1
+            d -= datetime.timedelta(days=1)
+        if hist:
+            st_html(f"""
+            <div class='card'><div class='section'>Top-50 hit rate by slate</div>
+            <div class='tbl-wrap'><table class='tbl'>
+              <tr><th>Slate</th><th>Players</th><th>1+ pt hit</th><th>Model exp.</th><th>Pts vs proj</th></tr>{hist}
+            </table></div></div>
+            """)
+        else:
+            st.info("No completed slates found in that range.")
+    st.caption(
+        "Re-projected with today's season-to-date stats, the NHL-confirmed starting goalies, and only players who "
+        "dressed, so this runs a bit optimistic versus true pregame picks."
+    )
+    st.divider()
+    st_html("<div class='section'>🏆 Season: team winner picks</div>")
 
 with tab_rec:
     end_d = min(slate_date, est_now.date()) - datetime.timedelta(days=1)
