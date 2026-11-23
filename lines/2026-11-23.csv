@@ -1,0 +1,112 @@
+game,market,player,line,over_odds,under_odds
+CBJ@NJD,ML,CBJ,,+170,
+CBJ@NJD,ML,NJD,,-205,
+CBJ@NJD,TOTAL,,6.5,+110,-130
+LAK@MTL,ML,LAK,,+124,
+LAK@MTL,ML,MTL,,-148,
+LAK@MTL,TOTAL,,6.5,+110,-130
+CGY@OTT,ML,CGY,,+190,
+CGY@OTT,ML,OTT,,-230,
+CGY@OTT,TOTAL,,5.5,-125,+105
+TOR@NYI,ML,TOR,,+136,
+TOR@NYI,ML,NYI,,-162,
+TOR@NYI,TOTAL,,6.5,-108,-112
+UTA@WPG,ML,UTA,,-118,
+UTA@WPG,ML,WPG,,-102,
+UTA@WPG,TOTAL,,6.5,-110,-110
+ANA@SEA,ML,ANA,,-108,
+ANA@SEA,ML,SEA,,-112,
+ANA@SEA,TOTAL,,6.5,-125,+105
+MIN@SJS,ML,MIN,,-205,
+MIN@SJS,ML,SJS,,+170,
+MIN@SJS,TOTAL,,6.5,+105,-125
+CBJ@NJD,SOG,Jack Hughes,3.5,-115,-115
+CBJ@NJD,SOG,Timo Meier,3.5,+110,-150
+CBJ@NJD,SOG,Zach Werenski,2.5,-175,+130
+CBJ@NJD,SOG,Adam Fantilli,2.5,-105,-125
+CBJ@NJD,SOG,Dougie Hamilton,2.5,+110,-150
+CBJ@NJD,SOG,Arseny Gritsyuk,2.5,+115,-155
+CBJ@NJD,SOG,Luke Evangelista,2.5,+135,-185
+CBJ@NJD,SOG,Nico Hischier,2.5,+145,-195
+CBJ@NJD,SOG,Kent Johnson,1.5,-195,+140
+CBJ@NJD,SOG,Luke Hughes,1.5,-190,+140
+CBJ@NJD,SOG,Jesper Bratt,1.5,-170,+125
+CBJ@NJD,SOG,Evan Rodrigues,1.5,-155,+115
+CBJ@NJD,SOG,Matthew Knies,1.5,-120,-115
+CBJ@NJD,SOG,Charlie Coyle,1.5,-115,-115
+CBJ@NJD,SOG,Connor Brown,1.5,-115,-120
+CBJ@NJD,SOG,Valeri Nichushkin,1.5,-115,-115
+LAK@MTL,SOG,Cole Caufield,3.5,+120,-160
+LAK@MTL,SOG,Artemi Panarin,2.5,-165,+120
+LAK@MTL,SOG,Alex Laferriere,2.5,-150,+110
+LAK@MTL,SOG,Adrian Kempe,2.5,-130,-105
+LAK@MTL,SOG,Nick Suzuki,2.5,-115,-115
+LAK@MTL,SOG,Quinton Byfield,2.5,+100,-135
+LAK@MTL,SOG,Juraj Slafkovsky,2.5,+105,-145
+LAK@MTL,SOG,Kevin Fiala,2.5,+110,-145
+LAK@MTL,SOG,Alexandre Texier,2.5,+130,
+CGY@OTT,SOG,Shane Pinto,1.5,-185,+135
+CGY@OTT,SOG,Jake Sanderson,1.5,-180,+130
+CGY@OTT,SOG,Matvei Gridin,1.5,-180,+130
+CGY@OTT,SOG,Fabian Zetterlund,1.5,-170,+125
+CGY@OTT,SOG,Mikael Backlund,1.5,-170,+125
+CGY@OTT,SOG,Claude Giroux,1.5,-160,+120
+CGY@OTT,SOG,Thomas Chabot,1.5,-130,-105
+CGY@OTT,SOG,Stephen Halliday,1.5,-125,-110
+CGY@OTT,SOG,Yegor Sharangovich,1.5,-110,-125
+CGY@OTT,SOG,Zayne Parekh,1.5,-110,-125
+CGY@OTT,SOG,Morgan Frost,1.5,+115,-160
+TOR@NYI,SOG,Auston Matthews,3.5,-120,-115
+TOR@NYI,SOG,Matthew Schaefer,3.5,+110,-145
+TOR@NYI,SOG,Bo Horvat,2.5,-160,+120
+TOR@NYI,SOG,William Nylander,2.5,-110,-125
+TOR@NYI,SOG,Mathew Barzal,2.5,-105,-130
+TOR@NYI,SOG,John Tavares,2.5,+115,-160
+TOR@NYI,SOG,Darren Raddysh,2.5,+120,-165
+TOR@NYI,SOG,Jack Roslovic,2.5,+130,-180
+TOR@NYI,SOG,Kyle Palmieri,1.5,-170,+125
+TOR@NYI,SOG,Tony DeAngelo,1.5,-140,+100
+TOR@NYI,SOG,Gavin McKenna,1.5,-135,+100
+TOR@NYI,SOG,Victor Eklund,1.5,-130,-105
+TOR@NYI,SOG,Brayden Schenn,1.5,-115,-120
+TOR@NYI,SOG,Easton Cowan,1.5,-115,-115
+TOR@NYI,SOG,Simon Holmstrom,1.5,-115,-120
+TOR@NYI,SOG,Emil Heineman,1.5,+105,-140
+UTA@WPG,SOG,Kyle Connor,3.5,+105,-145
+UTA@WPG,SOG,Clayton Keller,2.5,-115,-115
+UTA@WPG,SOG,Logan Cooley,2.5,+120,-165
+UTA@WPG,SOG,Mikhail Sergachev,2.5,+125,-170
+UTA@WPG,SOG,Vincent Trocheck,2.5,+125,-170
+UTA@WPG,SOG,Cole Perfetti,2.5,+130,-175
+UTA@WPG,SOG,Mark Scheifele,2.5,+140,-190
+UTA@WPG,SOG,Josh Morrissey,1.5,-175,+130
+UTA@WPG,SOG,Gabriel Vilardi,1.5,-170,+125
+UTA@WPG,SOG,Dawson Mercer,1.5,-130,-105
+UTA@WPG,SOG,MacKenzie Weegar,1.5,-125,-110
+ANA@SEA,SOG,Cutter Gauthier,4.5,+105,-140
+ANA@SEA,SOG,Bobby McMann,2.5,+105,-145
+ANA@SEA,SOG,Brandon Montour,2.5,+125,-170
+ANA@SEA,SOG,Mikael Granlund,1.5,-195,+140
+ANA@SEA,SOG,Vince Dunn,1.5,-190,+140
+ANA@SEA,SOG,Mackie Samoskevich,1.5,-180,+130
+ANA@SEA,SOG,Jordan Eberle,1.5,-175,+130
+ANA@SEA,SOG,Troy Terry,1.5,-150,+110
+ANA@SEA,SOG,Matty Beniers,1.5,-130,-105
+ANA@SEA,SOG,Tristan Luneau,1.5,-125,-110
+ANA@SEA,SOG,Berkly Catton,1.5,-110,-120
+ANA@SEA,SOG,Alex Killorn,1.5,+100,-140
+ANA@SEA,SOG,Jackson LaCombe,1.5,+115,-155
+ANA@SEA,SOG,Chandler Stephenson,1.5,+170,-230
+MIN@SJS,SOG,Macklin Celebrini,3.5,-125,-110
+MIN@SJS,SOG,Matt Boldy,3.5,-115,-120
+MIN@SJS,SOG,Kirill Kaprizov,3.5,-110,-125
+MIN@SJS,SOG,Joel Eriksson Ek,2.5,-150,+110
+MIN@SJS,SOG,Will Smith,2.5,-105,-130
+MIN@SJS,SOG,Brock Faber,2.5,+135,-185
+MIN@SJS,SOG,Blake Coleman,1.5,-165,+125
+MIN@SJS,SOG,Ivar Stenberg,1.5,-160,+120
+MIN@SJS,SOG,Tyler Toffoli,1.5,-145,+105
+MIN@SJS,SOG,Mason Marchment,1.5,-140,+105
+MIN@SJS,SOG,Maxim Shabanov,1.5,-140,+105
+MIN@SJS,SOG,Jacob Trouba,1.5,-120,-115
+MIN@SJS,SOG,Michael Misa,1.5,+100,-135
