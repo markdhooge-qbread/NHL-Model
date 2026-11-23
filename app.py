@@ -665,7 +665,7 @@ def game_status(g, box):
     return {"kind": "sched", "label": g["time"], "text": "", "state": state}
 
 
-def live_card(g, box, status, sim):
+def live_card(g, box, status, sim, dk=None):
     aa, ha = g["away"], g["home"]
     box = box or {}
     started = status["kind"] != "sched"
@@ -716,6 +716,10 @@ def live_card(g, box, status, sim):
       </div>
       <div class='card-title' style='margin-bottom:8px;'>{score}</div>
       {table}
+      <div class='tbl-wrap'><table class='tbl' style='font-size:13px;'>
+        <tr><th>Pregame DK</th><th>{aa}</th><th>{ha}</th></tr>
+        {dk_game_rows(aa, ha, sim, dk)}
+      </table></div>
     </div>
     """
 
@@ -1029,6 +1033,28 @@ def price_pick(p_over, p_under, line, ov, dk_rec):
     return side, p, odds, imp, edge, "DK"
 
 
+def ev_per_100(p, odds):
+    """Expected profit on a $100 stake at American odds, given the model's win chance."""
+    if odds is None:
+        return None
+    win = odds if odds > 0 else 10000.0 / abs(odds)
+    return p * win - (1 - p) * 100
+
+
+def value_side(cands):
+    """Best-edge side among (label, side, p, odds, other_odds) candidates priced by DK; None if no odds."""
+    best = None
+    for label, side, p, odds, other in cands:
+        imp = implied_no_vig(odds, other)
+        if imp is None:
+            continue
+        edge = (p - imp) * 100
+        if best is None or edge > best["edge"]:
+            best = {"pick": label, "side": side, "p": p, "odds": odds, "imp": imp, "edge": edge,
+                    "ev": ev_per_100(p, odds)}
+    return best
+
+
 def bet_row_label(b):
     icon = STATUS_ICON[b["status"]]
     if b["odds"] is not None:
@@ -1292,8 +1318,13 @@ with tab_props:
 
 
 def build_bets(scores, bet_overrides, dk):
-    """Every game (ML, total) and player (SOG, points, goal) pick on the slate, with status."""
-    bets = []
+    """Every game (ML, total) and player (SOG, points, goal) pick on the slate, with status.
+    Also returns value picks: for each DK-priced market, the side (either one) with the biggest edge vs DK."""
+    bets, values = [], []
+
+    def add_value(v, base):
+        if v:
+            values.append({**base, **v})
     for g in games:
         aa, ha, gid = g["away"], g["home"], g["id"]
         live = scores.get(gid, {})
@@ -1322,15 +1353,24 @@ def build_bets(scores, bet_overrides, dk):
         else:
             odds, other, src = dk_ml.get(pick_team), dk_ml.get(opp_team), "DK"
         imp = implied_no_vig(odds, other)
-        if frac is None:
-            status, now = "pregame", g["time"]
-        else:
-            mine, theirs = (a_now, h_now) if pick_team == aa else (h_now, a_now)
+
+        def ml_status(team):
+            if frac is None:
+                return "pregame"
+            mine, theirs = (a_now, h_now) if team == aa else (h_now, a_now)
             if final:
-                status = "hit" if mine > theirs else "miss"
-            else:
-                status = "on" if mine > theirs else ("off" if mine < theirs else "tied")
-            now = f"{aa} {a_now}–{h_now} {ha} · {clock_txt}"
+                return "hit" if mine > theirs else "miss"
+            return "on" if mine > theirs else ("off" if mine < theirs else "tied")
+
+        status = ml_status(pick_team)
+        now = g["time"] if frac is None else f"{aa} {a_now}–{h_now} {ha} · {clock_txt}"
+        v = value_side([(f"{aa} ML", aa, sim["a_win"], dk_ml.get(aa), dk_ml.get(ha)),
+                        (f"{ha} ML", ha, sim["h_win"], dk_ml.get(ha), dk_ml.get(aa))])
+        if v:
+            v["pick"] = f"{v['pick']} ({game_lbl})"
+            add_value(v, {"kind": "Game", "market": "ML", "game": game_lbl, "time": g["time"],
+                          "status": ml_status(v["side"]), "now": now,
+                          "proj_txt": f"{aa} {sim['proj_a']:.2f} – {sim['proj_h']:.2f} {ha}"})
         bets.append({"id": bid, "kind": "Game", "market": "ML", "pick": f"{pick_team} ML ({game_lbl})",
                      "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "src": src,
                      "edge": (p - imp) * 100 if imp else None, "line": None, "line_txt": "ML",
@@ -1346,6 +1386,15 @@ def build_bets(scores, bet_overrides, dk):
         side, p, odds, imp, edge, src = price_pick(p_o, p_u, line, ov, dk_tot)
         status, pace = grade_count(side, line, a_now + h_now, final, frac)
         now = g["time"] if frac is None else f"{a_now + h_now} goals · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
+        if dk_tot and dk_tot.get("line") is not None:
+            tl = dk_tot["line"]
+            to, tu, _ = pmf_over_under(sim["tot_pmf"], tl)
+            v = value_side([(f"{game_lbl} O {tl:g}", "Over", to, dk_tot.get("over"), dk_tot.get("under")),
+                            (f"{game_lbl} U {tl:g}", "Under", tu, dk_tot.get("under"), dk_tot.get("over"))])
+            if v:
+                vs, _ = grade_count(v["side"], tl, a_now + h_now, final, frac)
+                add_value(v, {"kind": "Game", "market": "Total", "game": game_lbl, "time": g["time"],
+                              "status": vs, "now": now, "proj_txt": f"{sim['proj_tot']:.2f} goals"})
         bets.append({"id": bid, "kind": "Game", "market": "Total", "pick": f"{game_lbl} {side[0]} {line:g}",
                      "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge, "src": src,
                      "line": line, "line_txt": f"{side} {line:g}", "proj_txt": f"{sim['proj_tot']:.2f} goals",
@@ -1390,11 +1439,71 @@ def build_bets(scores, bet_overrides, dk):
                         now = g["time"] if in_lineup else "Not in lineup"
                     else:
                         now = f"{cur} {mkt} · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
+                    if dk_p and dk_p.get("line") is not None:
+                        dl = dk_p["line"]
+                        vo, vu, _ = line_probs(float(r[key]), dl)
+                        who = f"{r['name']} ({team})"
+                        if mkt == "Goal":
+                            cands = [(f"{who} anytime goal", "Over", vo, dk_p.get("over"), dk_p.get("under"))]
+                        else:
+                            cands = [(f"{who} O {dl:g} {mkt}", "Over", vo, dk_p.get("over"), dk_p.get("under")),
+                                     (f"{who} U {dl:g} {mkt}", "Under", vu, dk_p.get("under"), dk_p.get("over"))]
+                        v = value_side(cands)
+                        if v:
+                            vs, _ = grade_count(v["side"], dl, cur, final, frac if in_lineup else None)
+                            add_value(v, {"kind": "Player", "market": mkt, "game": game_lbl, "time": g["time"],
+                                          "status": vs, "now": now, "proj_txt": f"{float(r[key]):.2f} {mkt}"})
                     bets.append({"id": bid, "kind": "Player", "market": mkt, "pick": pick, "game": game_lbl,
                                  "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
                                  "src": src, "line": line, "line_txt": line_txt,
                                  "proj_txt": f"{float(r[key]):.2f} {mkt}", "status": status, "now": now})
-    return bets
+    return bets, values
+
+
+def best_bets_card(rows):
+    trs = ""
+    for v in rows:
+        color = "#86efac" if v["edge"] >= 5 else "#cbd5e1"
+        ev = f"{v['ev']:+.0f}" if v["ev"] is not None else "NA"
+        trs += (f"<tr><td>{STATUS_ICON[v['status']]} <b>{v['pick']}</b><br>"
+                f"<span class='card-sub'>{v['time']} · proj {v['proj_txt']}</span></td>"
+                f"<td><b>{fmt_odds(v['odds'])}</b></td>"
+                f"<td>{v['p']*100:.0f}% <span class='card-sub'>vs {v['imp']*100:.0f}%</span></td>"
+                f"<td><b style='color:{color}'>{v['edge']:+.1f}</b><br><span class='card-sub'>EV {ev}</span></td></tr>")
+    return f"""
+    <div class='card'>
+      <div class='tbl-wrap'><table class='tbl'>
+        <tr><th>Pick</th><th>DK</th><th>Model vs DK</th><th>Edge</th></tr>
+        {trs}
+      </table></div>
+    </div>
+    """
+
+
+def best_bets_section(values):
+    st.subheader("🔥 Best bets vs DK")
+    if not values:
+        st.info("No DraftKings lines for this date yet. Send DK screenshots (or add ODDS_API_KEY) and the best bets show here.")
+        return
+    c1, c2, c3 = st.columns(3)
+    mkts = c1.selectbox("Market", ["All", "Games", "SOG", "Points", "Goals"], key="best_mkt")
+    min_edge = c2.selectbox("Min edge", [2, 3, 5, 8], index=1, key="best_edge")
+    n_best = c3.selectbox("Show", [5, 10, 20], index=1, key="best_n")
+    long_shots = st.toggle("Include long shots (model under 35%)", value=False, key="best_long")
+    want = {"Games": ("ML", "Total"), "SOG": ("SOG",), "Points": ("Pts",), "Goals": ("Goal",)}.get(mkts)
+    rows = [v for v in values
+            if v["edge"] >= min_edge and (long_shots or v["p"] >= 0.35) and (want is None or v["market"] in want)]
+    rows.sort(key=lambda v: v["edge"], reverse=True)
+    rows = rows[:n_best]
+    if not rows:
+        st.caption("Nothing clears that edge right now. Try a lower minimum edge or include long shots.")
+        return
+    settled = [v for v in rows if v["status"] in ("hit", "miss")]
+    rec = f" · {sum(v['status'] == 'hit' for v in settled)}-{sum(v['status'] == 'miss' for v in settled)} settled" if settled else ""
+    st.caption(f"Either side of every DK line, ranked by edge (model % minus DK's no-vig %). EV = expected profit per $100{rec}.")
+    st_html(best_bets_card(rows))
+    st.caption("Anytime goal has no DK 'no' price, so its edge is vs DK's price with the vig left in. "
+               "A huge edge usually means the model is missing news (injury, scratch, line change), so check before betting.")
 
 
 with tab_bets:
@@ -1402,6 +1511,14 @@ with tab_bets:
         st.session_state.bet_overrides = {}
     bet_overrides = st.session_state.bet_overrides
 
+    try:
+        scores_now = load_scores(date_str)
+    except Exception:  # noqa: BLE001
+        scores_now = {}
+    all_bets, value_bets = build_bets(scores_now, bet_overrides, dk_lines)
+    best_bets_section(value_bets)
+
+    st.subheader("📋 All picks")
     c1, c2 = st.columns(2)
     bet_kind = c1.radio("Show", ["All", "Games", "Players"], horizontal=True, key="bets_kind")
     min_p = c2.slider("Min model %", 50, 80, 55, step=1, key="bets_min_p")
@@ -1409,11 +1526,6 @@ with tab_bets:
     n_show = c3.selectbox("How many", [15, 25, 50, 100], index=1, key="bets_n")
     status_f = c4.selectbox("Status", ["Any", "Pregame", "Live", "Settled"], key="bets_status")
 
-    try:
-        scores_now = load_scores(date_str)
-    except Exception:  # noqa: BLE001
-        scores_now = {}
-    all_bets = build_bets(scores_now, bet_overrides, dk_lines)
 
     def keep(b):
         if bet_kind == "Games" and b["kind"] != "Game":
@@ -1556,7 +1668,7 @@ with tab_live:
                 ag, hg = resolve_goalie(g, "away", use_override=False), resolve_goalie(g, "home", use_override=False)
                 sim = model.simulate_game(aa, ha, ag, hg)
                 with st.expander(live_label(g, box, status), expanded=live_open):
-                    st_html(live_card(g, box, status, sim))
+                    st_html(live_card(g, box, status, sim, dk_lines))
                     if box and status["kind"] != "sched":
                         actual = parse_box_players(box)
                         a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
