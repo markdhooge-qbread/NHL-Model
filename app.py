@@ -10,6 +10,9 @@ Streamlit port of notebooks/player_model.ipynb:
 import datetime
 import io
 import math
+import os
+import re
+import unicodedata
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -32,6 +35,20 @@ NHL_API = "https://api-web.nhle.com/v1"
 MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
 SEASON_START = datetime.date(SEASON, 10, 1)
 DK_NHL_URL = "https://sportsbook.draftkings.com/leagues/hockey/nhl"
+LINES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lines")
+ODDS_API = "https://api.the-odds-api.com/v4/sports/icehockey_nhl"
+TEAM_ABBR = {
+    "Anaheim Ducks": "ANA", "Boston Bruins": "BOS", "Buffalo Sabres": "BUF", "Calgary Flames": "CGY",
+    "Carolina Hurricanes": "CAR", "Chicago Blackhawks": "CHI", "Colorado Avalanche": "COL",
+    "Columbus Blue Jackets": "CBJ", "Dallas Stars": "DAL", "Detroit Red Wings": "DET", "Edmonton Oilers": "EDM",
+    "Florida Panthers": "FLA", "Los Angeles Kings": "LAK", "Minnesota Wild": "MIN", "Montreal Canadiens": "MTL",
+    "Montréal Canadiens": "MTL", "Nashville Predators": "NSH", "New Jersey Devils": "NJD",
+    "New York Islanders": "NYI", "New York Rangers": "NYR", "Ottawa Senators": "OTT",
+    "Philadelphia Flyers": "PHI", "Pittsburgh Penguins": "PIT", "San Jose Sharks": "SJS", "Seattle Kraken": "SEA",
+    "St Louis Blues": "STL", "St. Louis Blues": "STL", "Tampa Bay Lightning": "TBL", "Toronto Maple Leafs": "TOR",
+    "Utah Mammoth": "UTA", "Utah Hockey Club": "UTA", "Vancouver Canucks": "VAN", "Vegas Golden Knights": "VGK",
+    "Washington Capitals": "WSH", "Winnipeg Jets": "WPG",
+}
 
 st.set_page_config(page_title="NHL Game Flow Model", page_icon="🏒", layout="centered")
 
@@ -438,7 +455,31 @@ def pace_tag(comb_cf, total):
     return "<span class='badge bal'>⚖️ BALANCED</span>"
 
 
-def slate_card(g, sim, ag, hg):
+def dk_game_rows(aa, ha, sim, dk):
+    """DK moneyline and total rows for a slate card (NA when no line)."""
+    def edge_txt(p, imp):
+        if imp is None:
+            return ""
+        e = (p - imp) * 100
+        color = "#86efac" if e >= 3 else ("#fca5a5" if e <= -3 else "#cbd5e1")
+        return f" <b style='color:{color}'>{e:+.0f}</b>"
+
+    ml = (dk or {}).get("ml", {}).get((aa, ha), {})
+    a_o, h_o = ml.get(aa), ml.get(ha)
+    a_cell = f"{fmt_odds(a_o)}{edge_txt(sim['a_win'], implied_no_vig(a_o, h_o))}" if a_o is not None else "NA"
+    h_cell = f"{fmt_odds(h_o)}{edge_txt(sim['h_win'], implied_no_vig(h_o, a_o))}" if h_o is not None else "NA"
+    tot = (dk or {}).get("total", {}).get((aa, ha))
+    if tot and tot.get("line") is not None:
+        p_o, p_u, _ = pmf_over_under(sim["tot_pmf"], tot["line"])
+        o_cell = f"O{tot['line']:g} {fmt_odds(tot.get('over'))}{edge_txt(p_o, implied_no_vig(tot.get('over'), tot.get('under')))}"
+        u_cell = f"U{tot['line']:g} {fmt_odds(tot.get('under'))}{edge_txt(p_u, implied_no_vig(tot.get('under'), tot.get('over')))}"
+        tot_row = f"<tr><td>DK total (edge)</td><td>{o_cell}</td><td>{u_cell}</td></tr>"
+    else:
+        tot_row = "<tr><td>DK total (edge)</td><td colspan='2'>NA</td></tr>"
+    return f"<tr><td>DK ML (edge)</td><td>{a_cell}</td><td>{h_cell}</td></tr>{tot_row}"
+
+
+def slate_card(g, sim, ag, hg, dk=None):
     aa, ha, a, h = g["away"], g["home"], sim["a"], sim["h"]
     tag = pace_tag(a["cf60"] + h["cf60"], sim["proj_tot"])
     a_b = B2B_BADGE if sim["a_b2b"] else ""
@@ -462,46 +503,49 @@ def slate_card(g, sim, ag, hg):
         <tr><td>PP xG (PP mins)</td><td><b>{sim['a_pp']:.2f}</b> ({sim['app_m']:.1f}m)</td><td><b>{sim['h_pp']:.2f}</b> ({sim['hpp_m']:.1f}m)</td></tr>
         <tr><td>Pace CF/60 | HDCF%</td><td>{a['cf60']:.1f} | {a['hdcf_pct']:.0f}%</td><td>{h['cf60']:.1f} | {h['hdcf_pct']:.0f}%</td></tr>
         <tr><td>Goalie GSAx/Game</td><td><b>{ag['label']}</b>{ag_b} ({ag['adj60']:+.2f})</td><td><b>{hg['label']}</b>{hg_b} ({hg['adj60']:+.2f})</td></tr>
+        {dk_game_rows(aa, ha, sim, dk)}
       </table></div>
     </div>
     """
 
 
-def props_card(title, df):
+def props_card(title, df, dk=None, game=None):
     rows = "".join(
         f"<tr><td><b>{r['name']}</b> <span class='card-sub'>({r['pos']})</span>"
         f"{SMALL_SAMPLE_BADGE if r['gp'] < 5 else ''}</td>"
         f"<td>{r['toi']:.1f}m <span style='color:#38bdf8;font-size:10px;'>({r['pp']:.1f} PP)</span></td>"
         f"<td><b>{r['sog']:.2f}</b></td>"
         f"<td>{r['xg']:.2f} ({r['atg']:.0f}%)</td>"
-        f"<td><b>{r['pts']:.2f}</b> ({r['pt_p']:.0f}%)</td></tr>"
+        f"<td><b>{r['pts']:.2f}</b> ({r['pt_p']:.0f}%)</td>"
+        f"<td>{dk_cell(dk_player(dk, r['name'], 'Pts', game or r.get('game')), r['pts'], 'Pts')}</td></tr>"
         for _, r in df.iterrows()
     )
     return f"""
     <div class='card'>
       <div class='section'>{title}</div>
       <div class='tbl-wrap'><table class='tbl'>
-        <tr><th>Player</th><th>TOI (PP)</th><th>SOG</th><th>xG (ATG%)</th><th>Pts (1+%)</th></tr>{rows}
+        <tr><th>Player</th><th>TOI (PP)</th><th>SOG</th><th>xG (ATG%)</th><th>Pts (1+%)</th><th>DK Pts</th></tr>{rows}
       </table></div>
     </div>
     """
 
 
-def ranked_card(title, rows_df):
+def ranked_card(title, rows_df, dk=None, mkt="Pts", key="pts"):
     rows = "".join(
         f"<tr><td>{i}</td>"
         f"<td><b>{r['name']}</b> <span class='card-sub'>({r['pos']}) {r['team']} vs {r['opp']}</span>"
         f"{SMALL_SAMPLE_BADGE if r['gp'] < 5 else ''}</td>"
         f"<td><b>{r['sog']:.2f}</b></td>"
         f"<td>{r['xg']:.2f} ({r['atg']:.0f}%)</td>"
-        f"<td><b>{r['pts']:.2f}</b> ({r['pt_p']:.0f}%)</td></tr>"
+        f"<td><b>{r['pts']:.2f}</b> ({r['pt_p']:.0f}%)</td>"
+        f"<td>{dk_cell(dk_player(dk, r['name'], mkt, r.get('game')), r[key], mkt)}</td></tr>"
         for i, (_, r) in enumerate(rows_df.iterrows(), start=1)
     )
     return f"""
     <div class='card'>
       <div class='section'>{title}</div>
       <div class='tbl-wrap'><table class='tbl'>
-        <tr><th>#</th><th>Player</th><th>SOG</th><th>xG (ATG%)</th><th>Pts (1+%)</th></tr>{rows}
+        <tr><th>#</th><th>Player</th><th>SOG</th><th>xG (ATG%)</th><th>Pts (1+%)</th><th>DK {mkt}</th></tr>{rows}
       </table></div>
     </div>
     """
@@ -709,6 +753,198 @@ def skater_compare_card(aa, a_df, ha, h_df, actual):
 
 
 # ----------------------------------------------------------------------------
+# DraftKings lines: lines/{date}.csv in the repo, The Odds API (optional key), manual edits
+# ----------------------------------------------------------------------------
+LINE_MARKETS = {"ML": "ML", "TOTAL": "TOT", "TOT": "TOT", "SOG": "SOG", "PTS": "Pts", "POINTS": "Pts",
+                "GOAL": "Goal", "ATG": "Goal"}
+
+
+def norm_name(name):
+    s = unicodedata.normalize("NFKD", str(name)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def dk_player(dk, name, mkt, game=None):
+    """DK prop for a player: game-specific entry first, then name-only (two players can share a name)."""
+    players = (dk or {}).get("player", {})
+    nm = norm_name(name)
+    if game and (game[0], game[1], nm, mkt) in players:
+        return players[(game[0], game[1], nm, mkt)]
+    return players.get((nm, mkt))
+
+
+def _odds(v):
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)) or str(v).strip() == "":
+            return None
+        return int(float(str(v).replace("+", "")))
+    except ValueError:
+        return None
+
+
+def _line(v):
+    try:
+        if v is None or str(v).strip() == "" or (isinstance(v, float) and math.isnan(v)):
+            return None
+        return float(v)
+    except ValueError:
+        return None
+
+
+def empty_lines():
+    return {"ml": {}, "total": {}, "player": {}}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_file_lines(date_str):
+    """DK lines transcribed into lines/{date}.csv (columns: game,market,player,line,over_odds,under_odds)."""
+    out = empty_lines()
+    path = os.path.join(LINES_DIR, f"{date_str}.csv")
+    if not os.path.exists(path):
+        return out, 0
+    df = pd.read_csv(path, dtype=str).fillna("")
+    n = 0
+    for _, r in df.iterrows():
+        mkt = LINE_MARKETS.get(r.get("market", "").strip().upper())
+        game = r.get("game", "").replace(" ", "").upper()
+        away, _, home = game.partition("@")
+        if not mkt:
+            continue
+        if mkt == "ML" and away and home:
+            odds = _odds(r.get("over_odds"))
+            if odds is not None:
+                out["ml"].setdefault((away, home), {})[r.get("player", "").strip().upper()] = odds
+                n += 1
+        elif mkt == "TOT" and away and home:
+            out["total"][(away, home)] = {"line": _line(r.get("line")), "over": _odds(r.get("over_odds")),
+                                         "under": _odds(r.get("under_odds"))}
+            n += 1
+        elif r.get("player"):
+            line = _line(r.get("line"))
+            rec = {"line": 0.5 if (mkt == "Goal" and line is None) else line,
+                   "over": _odds(r.get("over_odds")), "under": _odds(r.get("under_odds"))}
+            nm = norm_name(r["player"])
+            if away and home:
+                out["player"][(away, home, nm, mkt)] = rec
+            out["player"].setdefault((nm, mkt), rec)
+            n += 1
+    return out, n
+
+
+@st.cache_data(ttl=900, show_spinner="Fetching DraftKings odds...")
+def load_odds_api(api_key, date_str, include_props):
+    """DraftKings lines from The Odds API. Returns (lines, count, error)."""
+    out, n = empty_lines(), 0
+    base = {"apiKey": api_key, "regions": "us", "bookmakers": "draftkings", "oddsFormat": "american"}
+    try:
+        resp = requests.get(f"{ODDS_API}/odds", params={**base, "markets": "h2h,totals"}, timeout=20)
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return out, 0, str(exc)
+    keep = []
+    for ev in events:
+        start = datetime.datetime.fromisoformat(ev["commence_time"].replace("Z", "+00:00")).astimezone(EST)
+        if start.strftime("%Y-%m-%d") != date_str:
+            continue
+        away, home = TEAM_ABBR.get(ev.get("away_team")), TEAM_ABBR.get(ev.get("home_team"))
+        if not (away and home):
+            continue
+        keep.append((ev["id"], away, home))
+        for bk in ev.get("bookmakers", []):
+            for m in bk.get("markets", []):
+                if m["key"] == "h2h":
+                    for o in m["outcomes"]:
+                        ab = TEAM_ABBR.get(o["name"])
+                        if ab:
+                            out["ml"].setdefault((away, home), {})[ab] = int(o["price"])
+                            n += 1
+                elif m["key"] == "totals":
+                    t = {"line": None, "over": None, "under": None}
+                    for o in m["outcomes"]:
+                        t["line"] = float(o.get("point")) if o.get("point") is not None else t["line"]
+                        t["over" if o["name"] == "Over" else "under"] = int(o["price"])
+                    out["total"][(away, home)] = t
+                    n += 1
+    if include_props:
+        prop_map = {"player_shots_on_goal": "SOG", "player_points": "Pts", "player_goal_scorer_anytime": "Goal"}
+        for eid, away, home in keep:
+            try:
+                resp = requests.get(f"{ODDS_API}/events/{eid}/odds",
+                                    params={**base, "markets": ",".join(prop_map)}, timeout=20)
+                resp.raise_for_status()
+                ev = resp.json()
+            except Exception:  # noqa: BLE001
+                continue
+            for bk in ev.get("bookmakers", []):
+                for m in bk.get("markets", []):
+                    mkt = prop_map.get(m["key"])
+                    if not mkt:
+                        continue
+                    for o in m["outcomes"]:
+                        player = o.get("description") or o.get("name")
+                        rec = out["player"].setdefault((away, home, norm_name(player), mkt),
+                                                       {"line": 0.5 if mkt == "Goal" else None, "over": None, "under": None})
+                        out["player"].setdefault((norm_name(player), mkt), rec)
+                        if o.get("point") is not None:
+                            rec["line"] = float(o["point"])
+                        side = "under" if o.get("name") in ("Under", "No") else "over"
+                        rec[side] = int(o["price"])
+                        n += 1
+    return out, n, None
+
+
+def merge_lines(*sources):
+    out = empty_lines()
+    for src in sources:
+        for k in out:
+            for key, val in src.get(k, {}).items():
+                if k == "ml":
+                    out[k].setdefault(key, {}).update(val)
+                else:
+                    out[k][key] = val
+    return out
+
+
+def side_price(dk_rec, line, side):
+    """DK odds for one side, only if the DK line matches the line being priced."""
+    if not dk_rec or dk_rec.get("line") is None or line is None or abs(dk_rec["line"] - line) > 1e-9:
+        return None, None
+    mine = dk_rec.get("over" if side == "Over" else "under")
+    other = dk_rec.get("under" if side == "Over" else "over")
+    return mine, other
+
+
+def implied_no_vig(mine, other):
+    """Implied % for my side; removes the vig when both sides are known."""
+    p_m = american_to_prob(mine) if mine is not None else None
+    if p_m is None:
+        return None
+    p_o = american_to_prob(other) if other is not None else None
+    return p_m / (p_m + p_o) if p_o else p_m
+
+
+def fmt_odds(o):
+    return f"{o:+d}" if o is not None else "NA"
+
+
+def dk_cell(dk_rec, mean, market_label):
+    """Compact 'O0.5 -180 · edge +4' for a player table, or NA."""
+    if not dk_rec or dk_rec.get("line") is None or dk_rec.get("over") is None:
+        return "<span class='card-sub'>NA</span>"
+    p_o, p_u, _ = line_probs(float(mean), dk_rec["line"])
+    side = "Over" if p_o >= p_u else "Under"
+    mine, other = side_price(dk_rec, dk_rec["line"], side)
+    imp = implied_no_vig(mine, other)
+    if imp is None:
+        return f"O{dk_rec['line']:g} {fmt_odds(dk_rec['over'])}"
+    p = p_o if side == "Over" else p_u
+    edge = (p - imp) * 100
+    color = "#86efac" if edge >= 3 else ("#fca5a5" if edge <= -3 else "#cbd5e1")
+    return f"{side[0]}{dk_rec['line']:g} {fmt_odds(mine)} · <b style='color:{color}'>{edge:+.0f}</b>"
+
+
+# ----------------------------------------------------------------------------
 # Bets board helpers
 # ----------------------------------------------------------------------------
 STATUS_ICON = {"pregame": "⚪", "on": "🟢", "off": "🟠", "tied": "🟡", "hit": "✅", "miss": "❌", "push": "➖"}
@@ -770,25 +1006,43 @@ def grade_count(side, line, current, final, frac):
 
 
 def choose_side(p_over, p_under, odds_over, odds_under):
-    """Pick the side with the higher model chance; return side, model %, odds, implied %, edge."""
+    """Pick the side with the higher model chance; return side, model %, odds, implied %, edge.
+    Implied % is no-vig when both sides' odds are known."""
     if p_over >= p_under:
-        side, p, odds = "Over", p_over, odds_over
+        side, p, odds, other = "Over", p_over, odds_over, odds_under
     else:
-        side, p, odds = "Under", p_under, odds_under
-    imp = american_to_prob(odds) if odds is not None else None
+        side, p, odds, other = "Under", p_under, odds_under, odds_over
+    imp = implied_no_vig(odds, other)
     edge = (p - imp) * 100 if imp else None
     return side, p, odds, imp, edge
 
 
+def price_pick(p_over, p_under, line, ov, dk_rec):
+    """Choose the model's side and price it: manual odds win, else DK odds at a matching line, else NA."""
+    side = "Over" if p_over >= p_under else "Under"
+    if "odds" in ov:
+        side, p, odds, imp, edge = choose_side(p_over, p_under, ov["odds"], ov["odds"])
+        imp = american_to_prob(odds)
+        return side, p, odds, imp, ((p - imp) * 100 if imp else None), "Manual"
+    o_over, o_under = side_price(dk_rec, line, "Over")
+    side, p, odds, imp, edge = choose_side(p_over, p_under, o_over, o_under)
+    return side, p, odds, imp, edge, "DK"
+
+
 def bet_row_label(b):
     icon = STATUS_ICON[b["status"]]
-    edge = f" · edge {b['edge']:+.0f}" if b["edge"] is not None else ""
-    return f"{icon} **{b['pick']}** · {b['p']*100:.0f}%{edge} · {b['now']}"
+    if b["odds"] is not None:
+        price = f" · {b['src']} {fmt_odds(b['odds'])}"
+        price += f" · edge {b['edge']:+.0f}" if b["edge"] is not None else ""
+    else:
+        price = " · DK NA"
+    return f"{icon} **{b['pick']}** · {b['p']*100:.0f}%{price} · {b['now']}"
 
 
 def bet_detail_card(b):
-    odds_txt = f"{b['odds']:+d} ({b['imp']*100:.1f}% implied)" if b["odds"] is not None and b["imp"] else "not entered"
-    edge_txt = f"{b['edge']:+.1f}%" if b["edge"] is not None else "—"
+    odds_txt = f"{b['src']} {fmt_odds(b['odds'])}" if b["odds"] is not None else "DK NA"
+    imp_txt = f"{b['imp']*100:.1f}%" if b["imp"] else "NA"
+    edge_txt = f"{b['edge']:+.1f}%" if b["edge"] is not None else "NA"
     return f"""
     <div class='card'>
       <div class='section'>{b['pick']} <span class='card-sub'>· {b['game']} · {b['time']}</span></div>
@@ -796,7 +1050,7 @@ def bet_detail_card(b):
         <tr><th>Pregame (locked)</th><th>Live / result</th></tr>
         <tr><td>Proj {b['proj_txt']}<br>Model {b['p']*100:.1f}% · fair {prob_to_american(b['p'])}</td>
             <td>{STATUS_ICON[b['status']]} {STATUS_TEXT[b['status']]}<br>{b['now']}</td></tr>
-        <tr><td>Line {b['line_txt']} · odds {odds_txt}</td><td>Edge {edge_txt}</td></tr>
+        <tr><td>Line {b['line_txt']} · {odds_txt}</td><td>Implied {imp_txt} · Edge {edge_txt}</td></tr>
       </table></div>
     </div>
     """
@@ -876,6 +1130,28 @@ def resolve_goalie(g, side, use_override=True):
     )
 
 
+# DraftKings lines: repo file for the date, then The Odds API if a key is set (API wins where both exist).
+try:
+    file_lines, n_file = load_file_lines(date_str)
+except Exception:  # noqa: BLE001
+    file_lines, n_file = empty_lines(), 0
+try:
+    odds_key = st.secrets.get("ODDS_API_KEY")
+except Exception:  # noqa: BLE001
+    odds_key = None
+api_lines, n_api, api_err = empty_lines(), 0, None
+with st.expander("📈 DraftKings lines"):
+    src_txt = [f"lines file: {n_file} lines" if n_file else "no lines file for this date"]
+    if odds_key:
+        want_props = st.toggle("Also fetch DK player props (uses more API credits)", value=True, key="odds_props")
+        api_lines, n_api, api_err = load_odds_api(odds_key, date_str, want_props)
+        src_txt.append(f"The Odds API: {n_api} prices" if not api_err else f"The Odds API error: {api_err}")
+    else:
+        src_txt.append("no ODDS_API_KEY in Streamlit secrets")
+    st.caption(" · ".join(src_txt) + ". Picks without a DK line show NA.")
+    st.link_button("Open NHL lines on DraftKings ↗", DK_NHL_URL, width="stretch")
+dk_lines = merge_lines(file_lines, api_lines)
+
 tab_bets, tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Bets", "Slate", "Player Props", "Live Tracker", "Record"])
 
 with tab_slate:
@@ -891,7 +1167,7 @@ with tab_slate:
             label = (f"**{aa} @ {ha}** · {g['time']} · {sim['proj_a']:.1f}–{sim['proj_h']:.1f}"
                      f" · {fav} {fav_p:.0f}% · Tot {sim['proj_tot']:.1f}{b2b}")
             with st.expander(label, expanded=slate_open):
-                st_html(slate_card(g, sim, ag, hg))
+                st_html(slate_card(g, sim, ag, hg, dk_lines))
         except Exception as exc:  # noqa: BLE001
             st.error(f"{aa} @ {ha}: could not simulate ({exc})")
 
@@ -922,7 +1198,8 @@ with tab_props:
             continue
         for df, team, opp, opp_g in ((df_a, g["away"], g["home"], hg), (df_h, g["home"], g["away"], ag)):
             for _, r in df.iterrows():
-                index.append({**r.to_dict(), "team": team, "opp": opp, "opp_goalie": opp_g, "time": g["time"]})
+                index.append({**r.to_dict(), "team": team, "opp": opp, "opp_goalie": opp_g, "time": g["time"],
+                              "game": (g["away"], g["home"])})
     index.sort(key=lambda r: r["name"])
     labels_ix = [f"{r['name']} ({r['team']} vs {r['opp']})" for r in index]
     sel = st.selectbox("Player", labels_ix, index=None, placeholder="Type a name: anyone playing tonight", key="search_player")
@@ -930,7 +1207,7 @@ with tab_props:
         r = index[labels_ix.index(sel)]
         st_html(
             props_card(f"{r['name']} · {r['team']} vs {r['opp']} ({r['time']}) · opp G {r['opp_goalie']['name']}{goalie_badges(r['opp_goalie'])}",
-                       pd.DataFrame([r])))
+                       pd.DataFrame([r]), dk_lines))
         markets = {"Shots on Goal": ("sog", 2.5), "Points": ("pts", 0.5), "Goals": ("xg", 0.5)}
         c1, c2 = st.columns(2)
         market = c1.selectbox("Market", list(markets), key="lc_market")
@@ -989,7 +1266,8 @@ with tab_props:
             if top != "All":
                 ranked = ranked.head(int(top.split()[1]))
             st.caption(f"{len(ranked)} of {len(index)} skaters across {len(games)} games, ranked by projected {sort_by.lower()}.")
-            st_html(ranked_card(f"Tonight's top projected {sort_by.lower()}", ranked))
+            mkt_key = {"Points": ("Pts", "pts"), "Shots on Goal": ("SOG", "sog"), "Goals (xG)": ("Goal", "xg")}[sort_by]
+            st_html(ranked_card(f"Tonight's top projected {sort_by.lower()}", ranked, dk_lines, *mkt_key))
 
     else:
         # -- Full matchup board --------------------------------------------
@@ -1007,13 +1285,13 @@ with tab_props:
             a_b = B2B_BADGE if aa in b2b_teams else ""
             h_b = B2B_BADGE if ha in b2b_teams else ""
             st_html(
-                props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a)
-                + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h))
+                props_card(f"{aa}{a_b} Skaters (vs {hg['name']}{goalie_badges(hg)})", df_a, dk_lines, (aa, ha))
+                + props_card(f"{ha}{h_b} Skaters (vs {ag['name']}{goalie_badges(ag)})", df_h, dk_lines, (aa, ha)))
         except Exception as exc:  # noqa: BLE001
             st.error(f"Could not project {aa} @ {ha}: {exc}")
 
 
-def build_bets(scores, bet_overrides):
+def build_bets(scores, bet_overrides, dk):
     """Every game (ML, total) and player (SOG, points, goal) pick on the slate, with status."""
     bets = []
     for g in games:
@@ -1032,13 +1310,18 @@ def build_bets(scores, bet_overrides):
         except Exception:  # noqa: BLE001
             continue
 
-        # Moneyline: model's side; odds only if entered.
+        # Moneyline: model's side; manual odds > DK odds > NA.
         bid = f"{gid}-ML"
         ov = bet_overrides.get(bid, {})
         pick_team = aa if sim["a_win"] >= sim["h_win"] else ha
+        opp_team = ha if pick_team == aa else aa
         p = max(sim["a_win"], sim["h_win"])
-        odds = ov.get("odds")
-        imp = american_to_prob(odds) if odds is not None else None
+        dk_ml = dk["ml"].get((aa, ha), {})
+        if "odds" in ov:
+            odds, other, src = ov["odds"], None, "Manual"
+        else:
+            odds, other, src = dk_ml.get(pick_team), dk_ml.get(opp_team), "DK"
+        imp = implied_no_vig(odds, other)
         if frac is None:
             status, now = "pregame", g["time"]
         else:
@@ -1049,7 +1332,7 @@ def build_bets(scores, bet_overrides):
                 status = "on" if mine > theirs else ("off" if mine < theirs else "tied")
             now = f"{aa} {a_now}–{h_now} {ha} · {clock_txt}"
         bets.append({"id": bid, "kind": "Game", "market": "ML", "pick": f"{pick_team} ML ({game_lbl})",
-                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp,
+                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "src": src,
                      "edge": (p - imp) * 100 if imp else None, "line": None, "line_txt": "ML",
                      "proj_txt": f"{aa} {sim['proj_a']:.2f} – {sim['proj_h']:.2f} {ha}",
                      "status": status, "now": now})
@@ -1057,13 +1340,14 @@ def build_bets(scores, bet_overrides):
         # Game total
         bid = f"{gid}-TOT"
         ov = bet_overrides.get(bid, {})
-        line = ov.get("line", default_total_line(sim["proj_tot"]))
+        dk_tot = dk["total"].get((aa, ha))
+        line = ov.get("line", (dk_tot or {}).get("line") or default_total_line(sim["proj_tot"]))
         p_o, p_u, _ = pmf_over_under(sim["tot_pmf"], line)
-        side, p, odds, imp, edge = choose_side(p_o, p_u, ov.get("odds"), ov.get("odds"))
+        side, p, odds, imp, edge, src = price_pick(p_o, p_u, line, ov, dk_tot)
         status, pace = grade_count(side, line, a_now + h_now, final, frac)
         now = g["time"] if frac is None else f"{a_now + h_now} goals · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
         bets.append({"id": bid, "kind": "Game", "market": "Total", "pick": f"{game_lbl} {side[0]} {line:g}",
-                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
+                     "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge, "src": src,
                      "line": line, "line_txt": f"{side} {line:g}", "proj_txt": f"{sim['proj_tot']:.2f} goals",
                      "status": status, "now": now})
 
@@ -1082,17 +1366,22 @@ def build_bets(scores, bet_overrides):
                 for mkt, key, dline, cur, dodds in markets:
                     bid = f"{gid}-{r['playerId']}-{mkt}"
                     ov = bet_overrides.get(bid, {})
-                    line = ov.get("line", dline)
+                    dk_p = dk_player(dk, r["name"], mkt, (aa, ha))
+                    line = ov.get("line", (dk_p or {}).get("line") or dline)
                     p_o, p_u, _ = line_probs(float(r[key]), line)
-                    odds_val = ov.get("odds", dodds)
                     if mkt == "Goal":
-                        side, p, odds = "Over", p_o, odds_val
-                        imp = american_to_prob(odds) if odds is not None else None
+                        side, p = "Over", p_o
+                        if "odds" in ov:
+                            odds, src, other = ov["odds"], "Manual", None
+                        else:
+                            odds, other = side_price(dk_p, line, "Over")
+                            src = "DK"
+                        imp = implied_no_vig(odds, other)
                         edge = (p - imp) * 100 if imp else None
                         pick = f"{r['name']} ({team}) anytime goal"
                         line_txt = "Anytime goal"
                     else:
-                        side, p, odds, imp, edge = choose_side(p_o, p_u, odds_val, odds_val)
+                        side, p, odds, imp, edge, src = price_pick(p_o, p_u, line, ov, dk_p)
                         pick = f"{r['name']} ({team}) {side[0]} {line:g} {mkt}"
                         line_txt = f"{side} {line:g} {mkt}"
                     in_lineup = (r["playerId"] in actual) if actual else True
@@ -1103,7 +1392,7 @@ def build_bets(scores, bet_overrides):
                         now = f"{cur} {mkt} · {clock_txt}" + (f" · pace {pace:.1f}" if not final else "")
                     bets.append({"id": bid, "kind": "Player", "market": mkt, "pick": pick, "game": game_lbl,
                                  "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
-                                 "line": line, "line_txt": line_txt,
+                                 "src": src, "line": line, "line_txt": line_txt,
                                  "proj_txt": f"{float(r[key]):.2f} {mkt}", "status": status, "now": now})
     return bets
 
@@ -1124,7 +1413,7 @@ with tab_bets:
         scores_now = load_scores(date_str)
     except Exception:  # noqa: BLE001
         scores_now = {}
-    all_bets = build_bets(scores_now, bet_overrides)
+    all_bets = build_bets(scores_now, bet_overrides, dk_lines)
 
     def keep(b):
         if bet_kind == "Games" and b["kind"] != "Game":
