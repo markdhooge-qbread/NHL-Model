@@ -19,6 +19,14 @@ Each cell is self-contained and pulls fresh data from MoneyPuck (`SEASON = 2026`
 - Run locally: `pip install -r requirements.txt`, then `streamlit run app.py`
 - Deploy: on Streamlit Community Cloud, create an app from this repo, choose branch `main`, and set the main file to `app.py`.
 
+## DraftKings lines
+
+Each pick is compared with the DraftKings price: line, odds, implied % and edge. Picks without a line show **NA**.
+
+- **Lines file:** add `lines/YYYY-MM-DD.csv`. The columns are explained in `lines/README.md`, and `lines/TEMPLATE.csv` has an example of each market.
+- **The Odds API (optional):** add `ODDS_API_KEY = "..."` in the app's Streamlit Cloud settings under **Secrets**, and DraftKings lines load automatically.
+- **Manual:** type a line and odds in **Bets › Edit lines & odds**. These edits last only for your browser session.
+
 ## Notebook
 
 Open the notebook in Google Colab and run the cells, or run it locally in Jupyter after `pip install -r requirements.txt`.
