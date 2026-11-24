@@ -1,9 +1,39 @@
 game,market,player,line,over_odds,under_odds
+VGK@EDM,ML,VGK,,-118,
+VGK@EDM,ML,EDM,,-102,
+VGK@EDM,TOTAL,,6.5,+105,-125
 VGK@EDM,P1PL,VGK,0.5,-220,
 VGK@EDM,P1PL,EDM,-0.5,+170,
-VGK@EDM,P1TOTAL,,1.5,-135,+105
-VGK@EDM,P1TNB,VGK,,-115,
+VGK@EDM,P1TOTAL,,1.5,-140,+110
+VGK@EDM,P1TNB,VGK,,-110,
 VGK@EDM,P1TNB,EDM,,-120,
-VGK@EDM,P1ML,VGK,,+180,
-VGK@EDM,P1ML,TIE,,+175,
-VGK@EDM,P1ML,EDM,,+180,
+VGK@EDM,P1ML,VGK,,+185,
+VGK@EDM,P1ML,TIE,,+180,
+VGK@EDM,P1ML,EDM,,+175,
+VGK@EDM,F10,,,-160,+124
+VGK@EDM,PTS,Connor McDavid,1.5,-115,-120
+VGK@EDM,PTS,Leon Draisaitl,1.5,-105,-125
+VGK@EDM,PTS,Jack Eichel,1.5,+170,-235
+VGK@EDM,PTS,Evan Bouchard,0.5,-240,+175
+VGK@EDM,PTS,Mitchell Marner,0.5,-200,+150
+VGK@EDM,PTS,Mark Stone,0.5,-185,+135
+VGK@EDM,PTS,Tomas Hertl,0.5,-125,-110
+VGK@EDM,PTS,Victor Olofsson,0.5,-110,-125
+VGK@EDM,PTS,Vasily Podkolzin,0.5,-105,-130
+VGK@EDM,PTS,Kasperi Kapanen,0.5,+125,-165
+VGK@EDM,PTS,Trevor Connelly,0.5,+130,-180
+VGK@EDM,PTS,William Karlsson,0.5,+140,
+VGK@EDM,SOG,Leon Draisaitl,3.5,+100,-135
+VGK@EDM,SOG,Connor McDavid,2.5,-135,+100
+VGK@EDM,SOG,Jack Eichel,2.5,-120,-115
+VGK@EDM,SOG,Mitchell Marner,2.5,-105,-130
+VGK@EDM,SOG,Evan Bouchard,2.5,+115,-155
+VGK@EDM,SOG,Tomas Hertl,2.5,+140,-190
+VGK@EDM,SOG,Trevor Connelly,2.5,+140,-190
+VGK@EDM,SOG,Victor Olofsson,1.5,-170,+125
+VGK@EDM,SOG,Mark Stone,1.5,-150,+110
+VGK@EDM,SOG,William Karlsson,1.5,-150,+110
+VGK@EDM,SOG,Vasily Podkolzin,1.5,-140,+105
+VGK@EDM,SOG,Kasperi Kapanen,1.5,-115,-115
+VGK@EDM,SOG,Shea Theodore,1.5,+105,-140
+VGK@EDM,SOG,Ivan Barbashev,0.5,-230,+170
