@@ -7,6 +7,7 @@ Streamlit port of notebooks/player_model.ipynb:
   4. Record       - season-to-date winner hit rate and goal error on final games
 """
 
+import base64
 import datetime
 import io
 import math
@@ -39,6 +40,12 @@ SEASON_START = datetime.date(SEASON, 10, 1)
 DK_NHL_URL = "https://sportsbook.draftkings.com/leagues/hockey/nhl"
 LINES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lines")
 ODDS_API = "https://api.the-odds-api.com/v4/sports/icehockey_nhl"
+GH_REPO = "markdhooge-qbread/NHL-Model"
+PICKS_BRANCH = "picks-data"      # snapshots live on their own branch so saving one doesn't redeploy the app
+PICKS_PATH = "picks/top_picks.csv"
+PICKS_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "picks", "top_picks.csv")
+PICK_COLS = ["date", "pick", "market", "game", "odds", "p", "imp", "edge", "saved_at"]
+TOP_MIN_EDGE, TOP_MIN_P = 3.0, 0.35  # same defaults as the Best bets board
 TEAM_ABBR = {
     "Anaheim Ducks": "ANA", "Boston Bruins": "BOS", "Buffalo Sabres": "BUF", "Calgary Flames": "CGY",
     "Carolina Hurricanes": "CAR", "Chicago Blackhawks": "CHI", "Colorado Avalanche": "COL",
@@ -1811,6 +1818,104 @@ def best_bets_section(values):
                "A huge edge usually means the model is missing news (injury, scratch, line change), so check before betting.")
 
 
+# ----------------------------------------------------------------------------
+# Top pick of the night: pregame snapshot store
+# ----------------------------------------------------------------------------
+def _gh_token():
+    try:
+        return st.secrets.get("GITHUB_TOKEN")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gh(method, path, token, **kw):
+    return requests.request(method, f"https://api.github.com/repos/{GH_REPO}/{path}", timeout=15,
+                            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, **kw)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_top_picks(token):
+    """Saved snapshots: the picks branch on GitHub when a token is set, else a local file (lost on app restart)."""
+    text, sha = None, None
+    if token:
+        try:
+            r = _gh("GET", f"contents/{PICKS_PATH}", token, params={"ref": PICKS_BRANCH})
+            if r.status_code == 200:
+                j = r.json()
+                text, sha = base64.b64decode(j["content"]).decode(), j["sha"]
+        except Exception:  # noqa: BLE001
+            pass
+    if text is None and os.path.exists(PICKS_LOCAL):
+        with open(PICKS_LOCAL) as f:
+            text = f.read()
+    df = pd.read_csv(io.StringIO(text)) if text else pd.DataFrame(columns=PICK_COLS)
+    return df.reindex(columns=PICK_COLS), sha
+
+
+def _ensure_branch(token):
+    if _gh("GET", f"branches/{PICKS_BRANCH}", token).status_code == 200:
+        return
+    main_sha = _gh("GET", "git/ref/heads/main", token).json()["object"]["sha"]
+    _gh("POST", "git/refs", token, json={"ref": f"refs/heads/{PICKS_BRANCH}", "sha": main_sha})
+
+
+def save_top_pick(row):
+    """Upsert one day's snapshot. Returns None on success, else an error string."""
+    token = _gh_token()
+    df, sha = load_top_picks(token)
+    df = pd.concat([df[df["date"] != row["date"]], pd.DataFrame([row])]).sort_values("date")
+    text = df.reindex(columns=PICK_COLS).to_csv(index=False)
+    err = None
+    if token:
+        try:
+            _ensure_branch(token)
+            body = {"message": f"Top pick snapshot {row['date']}", "branch": PICKS_BRANCH,
+                    "content": base64.b64encode(text.encode()).decode()}
+            if sha:
+                body["sha"] = sha
+            r = _gh("PUT", f"contents/{PICKS_PATH}", token, json=body)
+            if r.status_code not in (200, 201):
+                err = f"GitHub save failed ({r.status_code})"
+        except Exception as exc:  # noqa: BLE001
+            err = f"GitHub save failed ({exc})"
+    else:
+        err = "no GITHUB_TOKEN"
+    if err:
+        os.makedirs(os.path.dirname(PICKS_LOCAL), exist_ok=True)
+        with open(PICKS_LOCAL, "w") as f:
+            f.write(text)
+    load_top_picks.clear()
+    return err
+
+
+def top_value_pick(values):
+    rows = [v for v in values if v["edge"] >= TOP_MIN_EDGE and v["p"] >= TOP_MIN_P]
+    return max(rows, key=lambda v: v["edge"]) if rows else None
+
+
+def maybe_snapshot_top_pick(values, games, date_str, now):
+    """Before the slate's first puck drop, keep today's snapshot current; after it, the pick is locked."""
+    if not games or date_str != now.date().isoformat():
+        return None
+    if now >= min(g["start"] for g in games):
+        return "locked"
+    v = top_value_pick(values)
+    if not v:
+        return None
+    key = (date_str, v["pick"], v["odds"])
+    if st.session_state.get("top_pick_saved") == key:
+        return None
+    saved, _ = load_top_picks(_gh_token())
+    same = saved[(saved["date"] == date_str) & (saved["pick"] == v["pick"])]
+    if len(same) and int(same.iloc[0]["odds"]) == int(v["odds"]):
+        st.session_state["top_pick_saved"] = key
+        return None
+    st.session_state["top_pick_saved"] = key
+    return save_top_pick({"date": date_str, "pick": v["pick"], "market": v["market"], "game": v["game"],
+                          "odds": int(v["odds"]), "p": round(v["p"], 4), "imp": round(v["imp"], 4),
+                          "edge": round(v["edge"], 2), "saved_at": now.strftime("%H:%M ET")})
+
+
 with tab_bets:
     if "bet_overrides" not in st.session_state:
         st.session_state.bet_overrides = {}
@@ -1821,6 +1926,9 @@ with tab_bets:
     except Exception:  # noqa: BLE001
         scores_now = {}
     all_bets, value_bets = build_bets(scores_now, bet_overrides, dk_lines)
+    snap = maybe_snapshot_top_pick(value_bets, games, date_str, datetime.datetime.now(EST))
+    if snap and snap not in ("locked", "no GITHUB_TOKEN"):
+        st.caption(f"Couldn't save tonight's top pick: {snap}")
     best_bets_section(value_bets)
 
     st.subheader("📋 All picks")
@@ -2180,7 +2288,58 @@ def best_bets_record_section(today):
     st.divider()
 
 
+def top_pick_record_section(today):
+    st_html("<div class='section'>🎯 Top pick of the night (saved pregame)</div>")
+    token = _gh_token()
+    picks, _ = load_top_picks(token)
+    if picks.empty:
+        st.info("No top picks saved yet. The site saves the #1 best bet each day when it's opened before the "
+                "first puck drop, then locks it at puck drop.")
+        if not token:
+            st.caption("Add a GITHUB_TOKEN (contents: read & write on this repo) to Streamlit secrets so saved picks "
+                       "survive app restarts.")
+        return
+    rows, w, l, units = [], 0, 0, 0.0
+    for _, r in picks.sort_values("date", ascending=False).iterrows():
+        res = "pregame" if r["date"] >= today.isoformat() else "na"
+        if r["date"] <= today.isoformat():
+            try:
+                df = grade_best_bets(SEASON, r["date"], today.isoformat())
+                hit = df[df["pick"] == r["pick"]] if not df.empty else df
+                if len(hit):
+                    res = hit.iloc[0]["result"]
+            except Exception:  # noqa: BLE001
+                pass
+        u = units_won(int(r["odds"]), res) if res in ("hit", "miss", "push") else 0.0
+        w += res == "hit"
+        l += res == "miss"
+        units += u
+        rows.append(f"<tr><td>{STATUS_ICON.get(res, '❔')} <b>{r['pick']}</b><br>"
+                    f"<span class='card-sub'>{r['date'][5:]} · saved {r['saved_at']}</span></td>"
+                    f"<td>{fmt_odds(int(r['odds']))}</td><td>{float(r['p'])*100:.0f}% "
+                    f"<span class='card-sub'>vs {float(r['imp'])*100:.0f}%</span></td>"
+                    f"<td>{float(r['edge']):+.1f}<br><span class='card-sub'>"
+                    f"{(f'{u:+.2f}u') if res in ('hit', 'miss', 'push') else STATUS_TEXT.get(res, '')}</span></td></tr>")
+    n = w + l
+    c1, c2 = st.columns(2)
+    c1.metric("Top pick record", f"{w}-{l}", f"{w / max(n, 1) * 100:.0f}% hit" if n else "no results yet", delta_color="off")
+    c2.metric("Units (1u flat)", f"{units:+.2f}u", f"ROI {units / max(n, 1) * 100:+.1f}%" if n else "", delta_color="off")
+    st_html(f"""
+    <div class='card'><div class='tbl-wrap'><table class='tbl'>
+      <tr><th>Pick</th><th>DK</th><th>Model vs DK</th><th>Edge / result</th></tr>{''.join(rows)}
+    </table></div></div>
+    """)
+    st.caption(f"The #1 Best bets pick (edge {TOP_MIN_EDGE:g}+ and model {TOP_MIN_P*100:.0f}%+, all markets), saved "
+               "pregame and locked at the first puck drop. Graded on the final box score; ❔ means the result "
+               "isn't available yet or the player didn't dress.")
+    if not token:
+        st.caption("⚠️ No GITHUB_TOKEN in Streamlit secrets, so picks are saved on the app server only and are lost "
+                   "when it restarts.")
+    st.divider()
+
+
 with tab_rec:
+    top_pick_record_section(est_now.date())
     best_bets_record_section(est_now.date())
 
     # -- Daily top-50 player review ---------------------------------------
