@@ -28,6 +28,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 EST = ZoneInfo("America/New_York")
 N_SIMS = 10_000
 GAMMA_SHAPE = 18.0
+P1_SHARE = 0.30   # share of regulation goals scored in the 1st period (league ~30/35/35)
+F10_SHARE = 0.48  # share of 1st-period goals scored in its first 10 minutes
 B2B_OFF = 0.94   # 6% offensive drag for a team on a back-to-back
 B2B_DEF = 1.04   # 4% defensive fatigue penalty (opponent of a B2B team gains)
 MP_BASE = "https://moneypuck.com/moneypuck/playerData/seasonSummary"
@@ -386,6 +388,10 @@ class Model:
             af[idx[away_ot]] += 1
             hf[idx[~away_ot]] += 1
         tot = af + hf
+        # 1st period: thin each team's regulation goals to the 1st period, then to its first 10 minutes.
+        a1, h1 = rng.binomial(ar, P1_SHARE), rng.binomial(hr, P1_SHARE)
+        t1 = a1 + h1
+        f10 = rng.binomial(t1, F10_SHARE)
 
         return {
             "a": a, "h": h, "a_b2b": a_b2b, "h_b2b": h_b2b,
@@ -395,6 +401,10 @@ class Model:
             "a_win": (af > hf).mean(), "h_win": (hf > af).mean(),
             "o55": (tot > 5.5).mean(),
             "tot_pmf": np.bincount(tot) / len(tot),
+            "p1_a": a1.mean(), "p1_h": h1.mean(), "p1_tot": t1.mean(),
+            "p1_pmf": np.bincount(t1, minlength=3) / len(t1),
+            "p1_a_win": (a1 > h1).mean(), "p1_h_win": (h1 > a1).mean(), "p1_tie": (a1 == h1).mean(),
+            "f10": (f10 > 0).mean(),
         }
 
     # -- Player props -------------------------------------------------------
@@ -476,7 +486,52 @@ def dk_game_rows(aa, ha, sim, dk):
         tot_row = f"<tr><td>DK total (edge)</td><td>{o_cell}</td><td>{u_cell}</td></tr>"
     else:
         tot_row = "<tr><td>DK total (edge)</td><td colspan='2'>NA</td></tr>"
-    return f"<tr><td>DK ML (edge)</td><td>{a_cell}</td><td>{h_cell}</td></tr>{tot_row}"
+    p1m = (dk or {}).get("p1ml", {}).get((aa, ha), {})
+    p1t = (dk or {}).get("p1total", {}).get((aa, ha))
+    f10 = (dk or {}).get("f10", {}).get((aa, ha))
+    p1pl = (dk or {}).get("p1pl", {}).get((aa, ha), {})
+    p1tnb = (dk or {}).get("p1tnb", {}).get((aa, ha), {})
+    if not (p1m or p1t or f10 or p1pl or p1tnb):
+        p1_rows = "<tr><td>DK 1st period</td><td colspan='2'>NA</td></tr>"
+    else:
+        def m3(k, p):
+            o = p1m.get(k)
+            return f"{fmt_odds(o)}{edge_txt(p, implied_3way(p1m, k))}" if o is not None else "NA"
+        p1_rows = ""
+        if p1m:
+            p1_rows += (f"<tr><td>DK 1st ML (tie {m3('TIE', sim['p1_tie'])})</td>"
+                        f"<td>{m3(aa, sim['p1_a_win'])}</td><td>{m3(ha, sim['p1_h_win'])}</td></tr>")
+        cells = {}
+        for mkt, cands in p1_extra_cands(aa, ha, sim, dk, "").items():
+            for label, side, p, odds, other in cands:
+                team = side[0] if mkt == "P1 PL" else side
+                pre = f"{side[1]:+g} " if mkt == "P1 PL" else ""
+                cells[(mkt, team)] = f"{pre}{fmt_odds(odds)}{edge_txt(p, implied_no_vig(odds, other))}"
+        for mkt, lbl in (("P1 PL", "DK 1st puck line"), ("P1 TNB", "DK 1st tie no bet")):
+            if any(k[0] == mkt for k in cells):
+                p1_rows += (f"<tr><td>{lbl}</td><td>{cells.get((mkt, aa), 'NA')}</td>"
+                            f"<td>{cells.get((mkt, ha), 'NA')}</td></tr>")
+        if p1t and p1t.get("line") is not None:
+            q_o, q_u, _ = pmf_over_under(sim["p1_pmf"], p1t["line"])
+            p1_rows += (f"<tr><td>DK 1st total</td>"
+                        f"<td>O{p1t['line']:g} {fmt_odds(p1t.get('over'))}{edge_txt(q_o, implied_no_vig(p1t.get('over'), p1t.get('under')))}</td>"
+                        f"<td>U{p1t['line']:g} {fmt_odds(p1t.get('under'))}{edge_txt(q_u, implied_no_vig(p1t.get('under'), p1t.get('over')))}</td></tr>")
+        else:
+            p1_rows += "<tr><td>DK 1st total</td><td colspan='2'>NA</td></tr>"
+        if f10:
+            p1_rows += (f"<tr><td>DK goal first 10</td>"
+                        f"<td>Yes {fmt_odds(f10.get('over'))}{edge_txt(sim['f10'], implied_no_vig(f10.get('over'), f10.get('under')))}</td>"
+                        f"<td>No {fmt_odds(f10.get('under'))}{edge_txt(1 - sim['f10'], implied_no_vig(f10.get('under'), f10.get('over')))}</td></tr>")
+        else:
+            p1_rows += "<tr><td>DK goal first 10</td><td colspan='2'>NA</td></tr>"
+    return f"<tr><td>DK ML (edge)</td><td>{a_cell}</td><td>{h_cell}</td></tr>{tot_row}{p1_rows}"
+
+
+def p1_summary(aa, ha, sim):
+    o15 = pmf_over_under(sim["p1_pmf"], 1.5)[0]
+    return (f"<div><b>1st:</b> {aa} {sim['p1_a']:.2f} — {ha} {sim['p1_h']:.2f} · "
+            f"win {aa} {sim['p1_a_win']*100:.0f}% / tie {sim['p1_tie']*100:.0f}% / {ha} {sim['p1_h_win']*100:.0f}%</div>"
+            f"<div><b>1st O1.5:</b> {o15*100:.0f}% · <b>Goal in first 10:</b> {sim['f10']*100:.0f}%</div>")
 
 
 def slate_card(g, sim, ag, hg, dk=None):
@@ -496,6 +551,7 @@ def slate_card(g, sim, ag, hg, dk=None):
         <div><b>Proj:</b> {aa} {sim['proj_a']:.2f} — {ha} {sim['proj_h']:.2f}</div>
         <div><b>Win:</b> {aa} {sim['a_win']*100:.0f}% | {ha} {sim['h_win']*100:.0f}%</div>
         <div><b>Tot:</b> {sim['proj_tot']:.2f} (O5.5: {sim['o55']*100:.0f}%)</div>
+        {p1_summary(aa, ha, sim)}
       </div>
       <div class='tbl-wrap'><table class='tbl'>
         <tr><th>Per-Game</th><th>{aa}</th><th>{ha}</th></tr>
@@ -665,7 +721,7 @@ def game_status(g, box):
     return {"kind": "sched", "label": g["time"], "text": "", "state": state}
 
 
-def live_card(g, box, status, sim, dk=None):
+def live_card(g, box, status, sim, dk=None, p1=None):
     aa, ha = g["away"], g["home"]
     box = box or {}
     started = status["kind"] != "sched"
@@ -698,6 +754,7 @@ def live_card(g, box, status, sim, dk=None):
             <tr><td><b>{aa} Goals</b></td><td>{sim['proj_a']:.2f}</td><td><b>{act_a}</b></td><td>{act_a - sim['proj_a']:+.2f}</td></tr>
             <tr><td><b>{ha} Goals</b></td><td>{sim['proj_h']:.2f}</td><td><b>{act_h}</b></td><td>{act_h - sim['proj_h']:+.2f}</td></tr>
             <tr><td><b>Total Goals</b></td><td>{sim['proj_tot']:.2f}</td><td><b>{act_tot}</b></td><td>{act_tot - sim['proj_tot']:+.2f}</td></tr>
+            {p1_live_row(sim, p1)}
             <tr><td><b>Shots on Goal</b></td><td>Pace {sim['a']['ca60']:.0f} / {sim['h']['ca60']:.0f}</td><td><b>{sog_a} — {sog_h}</b></td><td>{ha} {sog_h - sog_a:+d}</td></tr>
           </table></div>"""
     else:
@@ -707,6 +764,7 @@ def live_card(g, box, status, sim, dk=None):
             <div><b>Proj:</b> {aa} {sim['proj_a']:.2f} — {ha} {sim['proj_h']:.2f}</div>
             <div><b>Win:</b> {aa} {sim['a_win']*100:.0f}% | {ha} {sim['h_win']*100:.0f}%</div>
             <div><b>Tot:</b> {sim['proj_tot']:.2f}</div>
+            {p1_summary(aa, ha, sim)}
           </div>"""
     return f"""
     <div class='card' style='margin-bottom:4px;'>
@@ -722,6 +780,16 @@ def live_card(g, box, status, sim, dk=None):
       </table></div>
     </div>
     """
+
+
+def p1_live_row(sim, p1):
+    proj = f"{sim['p1_a']:.2f} — {sim['p1_h']:.2f}"
+    if not p1:
+        return f"<tr><td><b>1st Period</b></td><td>{proj}</td><td>NA</td><td></td></tr>"
+    a1, h1 = p1["a1"], p1["h1"]
+    f10 = "goal by 10:00 ✅" if p1["first"] is not None and p1["first"] < 10 else "no goal by 10:00"
+    return (f"<tr><td><b>1st Period</b></td><td>{proj}</td><td><b>{a1} — {h1}</b></td>"
+            f"<td><span class='card-sub'>{f10}</span></td></tr>")
 
 
 def live_label(g, box, status):
@@ -760,7 +828,9 @@ def skater_compare_card(aa, a_df, ha, h_df, actual):
 # DraftKings lines: lines/{date}.csv in the repo, The Odds API (optional key), manual edits
 # ----------------------------------------------------------------------------
 LINE_MARKETS = {"ML": "ML", "TOTAL": "TOT", "TOT": "TOT", "SOG": "SOG", "PTS": "Pts", "POINTS": "Pts",
-                "GOAL": "Goal", "ATG": "Goal"}
+                "GOAL": "Goal", "ATG": "Goal", "P1TOTAL": "P1TOT", "P1TOT": "P1TOT", "P1ML": "P1ML",
+                "P13WAY": "P1ML", "F10": "F10", "GOAL10": "F10", "P1PL": "P1PL", "P1PUCK": "P1PL",
+                "P1TNB": "P1TNB"}
 
 
 def norm_name(name):
@@ -796,7 +866,7 @@ def _line(v):
 
 
 def empty_lines():
-    return {"ml": {}, "total": {}, "player": {}}
+    return {"ml": {}, "total": {}, "player": {}, "p1total": {}, "p1ml": {}, "f10": {}, "p1pl": {}, "p1tnb": {}}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -822,6 +892,30 @@ def load_file_lines(date_str):
         elif mkt == "TOT" and away and home:
             out["total"][(away, home)] = {"line": _line(r.get("line")), "over": _odds(r.get("over_odds")),
                                          "under": _odds(r.get("under_odds"))}
+            n += 1
+        elif mkt == "P1TOT" and away and home:
+            out["p1total"][(away, home)] = {"line": _line(r.get("line")), "over": _odds(r.get("over_odds")),
+                                           "under": _odds(r.get("under_odds"))}
+            n += 1
+        elif mkt == "P1ML" and away and home:
+            odds = _odds(r.get("over_odds"))
+            side = r.get("player", "").strip().upper()
+            side = "TIE" if side in ("TIE", "DRAW", "X", "") else side
+            if odds is not None:
+                out["p1ml"].setdefault((away, home), {})[side] = odds
+                n += 1
+        elif mkt == "P1PL" and away and home:
+            line, odds = _line(r.get("line")), _odds(r.get("over_odds"))
+            if line is not None and odds is not None:
+                out["p1pl"].setdefault((away, home), {})[r.get("player", "").strip().upper()] = {"line": line, "odds": odds}
+                n += 1
+        elif mkt == "P1TNB" and away and home:
+            odds = _odds(r.get("over_odds"))
+            if odds is not None:
+                out["p1tnb"].setdefault((away, home), {})[r.get("player", "").strip().upper()] = odds
+                n += 1
+        elif mkt == "F10" and away and home:
+            out["f10"][(away, home)] = {"line": 0.5, "over": _odds(r.get("over_odds")), "under": _odds(r.get("under_odds"))}
             n += 1
         elif r.get("player"):
             line = _line(r.get("line"))
@@ -903,7 +997,7 @@ def merge_lines(*sources):
     for src in sources:
         for k in out:
             for key, val in src.get(k, {}).items():
-                if k == "ml":
+                if k in ("ml", "p1ml", "p1pl", "p1tnb"):
                     out[k].setdefault(key, {}).update(val)
                 else:
                     out[k][key] = val
@@ -926,6 +1020,129 @@ def implied_no_vig(mine, other):
         return None
     p_o = american_to_prob(other) if other is not None else None
     return p_m / (p_m + p_o) if p_o else p_m
+
+
+def implied_3way(prices, key):
+    """Implied % for one outcome of a 3-way market; vig removed when all three prices are known."""
+    probs = {k: american_to_prob(v) for k, v in (prices or {}).items() if v is not None}
+    probs = {k: v for k, v in probs.items() if v}
+    if key not in probs:
+        return None
+    return probs[key] / sum(probs.values()) if len(probs) >= 3 else probs[key]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_landing(game_id):
+    resp = requests.get(f"{NHL_API}/gamecenter/{game_id}/landing", timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def p1_result(landing, aa, ha):
+    """1st-period goals per team and the earliest goal time (minutes) from the NHL landing feed; None if missing."""
+    scoring = ((landing or {}).get("summary") or {}).get("scoring")
+    if scoring is None:
+        return None
+    a1 = h1 = 0
+    first = None
+    for per in scoring:
+        if (per.get("periodDescriptor") or {}).get("number") != 1:
+            continue
+        for gl in per.get("goals") or []:
+            team = gl.get("teamAbbrev")
+            team = team.get("default") if isinstance(team, dict) else team
+            is_home = gl.get("isHome")
+            if is_home is None:
+                is_home = team == ha
+            if is_home:
+                h1 += 1
+            else:
+                a1 += 1
+            try:
+                mm, ss = str(gl.get("timeInPeriod", "20:00")).split(":")
+                t = int(mm) + int(ss) / 60.0
+            except ValueError:
+                t = 20.0
+            first = t if first is None else min(first, t)
+    return {"a1": a1, "h1": h1, "first": first}
+
+
+def p1_progress(live):
+    """(share of the 1st period played or None before puck drop, 1st period over?, minutes played in it)."""
+    if not live or live.get("gameState") not in LIVE_STATES + FINAL_STATES:
+        return None, False, 0.0
+    if live.get("gameState") in FINAL_STATES:
+        return 1.0, True, 20.0
+    num = (live.get("periodDescriptor") or {}).get("number") or 1
+    clock = live.get("clock") or {}
+    if num > 1 or clock.get("inIntermission"):
+        return 1.0, True, 20.0
+    try:
+        mm, ss = str(clock.get("timeRemaining", "20:00")).split(":")
+        mins = 20.0 - (int(mm) + int(ss) / 60.0)
+    except ValueError:
+        mins = 0.0
+    mins = max(min(mins, 20.0), 0.0)
+    return mins / 20.0, False, mins
+
+
+def p1_ml_status(pick, aa, a1, h1, done):
+    """pick is a team abbreviation or 'TIE'."""
+    if pick == "TIE":
+        if done:
+            return "hit" if a1 == h1 else "miss"
+        return "on" if a1 == h1 else "off"
+    mine, theirs = (a1, h1) if pick == aa else (h1, a1)
+    if done:
+        return "hit" if mine > theirs else "miss"
+    return "on" if mine > theirs else ("off" if mine < theirs else "tied")
+
+
+P1_MARKETS = ("P1 Total", "P1 ML", "F10", "P1 PL", "P1 TNB")
+
+
+def p1_extra_cands(aa, ha, sim, dk, game_lbl):
+    """DK-priced 1st-period puck line (+/-0.5) and tie-no-bet candidates, per market, for value_side."""
+    out = {}
+    win = {aa: sim["p1_a_win"], ha: sim["p1_h_win"]}
+    pl = (dk or {}).get("p1pl", {}).get((aa, ha), {})
+    cands = []
+    for team, opp in ((aa, ha), (ha, aa)):
+        rec = pl.get(team)
+        if rec:
+            p = win[team] + (sim["p1_tie"] if rec["line"] > 0 else 0.0)
+            cands.append((f"{team} {rec['line']:+g} 1st period ({game_lbl})", (team, rec["line"]), p,
+                          rec["odds"], (pl.get(opp) or {}).get("odds")))
+    if cands:
+        out["P1 PL"] = cands
+    tnb = (dk or {}).get("p1tnb", {}).get((aa, ha), {})
+    decided = max(win[aa] + win[ha], 1e-9)
+    cands = [(f"{team} 1st period, tie no bet ({game_lbl})", team, win[team] / decided, tnb.get(team), tnb.get(opp))
+             for team, opp in ((aa, ha), (ha, aa)) if tnb.get(team) is not None]
+    if cands:
+        out["P1 TNB"] = cands
+    return out
+
+
+def p1_extra_status(market, side, aa, a1, h1, done):
+    team, line = side if market == "P1 PL" else (side, 0.0)
+    mine, theirs = (a1, h1) if team == aa else (h1, a1)
+    if market == "P1 TNB" and done and mine == theirs:
+        return "push"
+    margin = mine - theirs + line
+    if done:
+        return "hit" if margin > 0 else "miss"
+    if market == "P1 TNB" and mine == theirs:
+        return "tied"
+    return "on" if margin > 0 else "off"
+
+
+def f10_status(side, first, mins, done):
+    """'Over' = yes, a goal in the first 10:00 of the game."""
+    scored = first is not None and first < 10.0
+    if scored or mins >= 10.0 or done:
+        return "hit" if scored == (side == "Over") else "miss"
+    return "on" if side == "Under" else "off"
 
 
 def fmt_odds(o):
@@ -951,9 +1168,9 @@ def dk_cell(dk_rec, mean, market_label):
 # ----------------------------------------------------------------------------
 # Bets board helpers
 # ----------------------------------------------------------------------------
-STATUS_ICON = {"pregame": "⚪", "on": "🟢", "off": "🟠", "tied": "🟡", "hit": "✅", "miss": "❌", "push": "➖"}
+STATUS_ICON = {"pregame": "⚪", "on": "🟢", "off": "🟠", "tied": "🟡", "hit": "✅", "miss": "❌", "push": "➖", "na": "❔"}
 STATUS_TEXT = {"pregame": "Pregame", "on": "On pace", "off": "Off pace", "tied": "Tied",
-               "hit": "Hit", "miss": "Miss", "push": "Push"}
+               "hit": "Hit", "miss": "Miss", "push": "Push", "na": "No period data yet"}
 
 
 def pmf_over_under(pmf, line):
@@ -1044,8 +1261,9 @@ def ev_per_100(p, odds):
 def value_side(cands):
     """Best-edge side among (label, side, p, odds, other_odds) candidates priced by DK; None if no odds."""
     best = None
-    for label, side, p, odds, other in cands:
-        imp = implied_no_vig(odds, other)
+    for c in cands:
+        label, side, p, odds, other = c[:5]
+        imp = c[5] if len(c) > 5 else implied_no_vig(odds, other)
         if imp is None:
             continue
         edge = (p - imp) * 100
@@ -1400,6 +1618,91 @@ def build_bets(scores, bet_overrides, dk):
                      "line": line, "line_txt": f"{side} {line:g}", "proj_txt": f"{sim['proj_tot']:.2f} goals",
                      "status": status, "now": now})
 
+        # 1st period: total, 3-way, goal in the first 10 minutes
+        f1, p1_done, p1_mins = p1_progress(live)
+        p1 = None
+        if f1 is not None:
+            try:
+                p1 = p1_result(load_landing(gid), aa, ha)
+            except Exception:  # noqa: BLE001
+                p1 = None
+        a1, h1 = (p1["a1"], p1["h1"]) if p1 else (0, 0)
+        p1_now = g["time"] if f1 is None else (
+            f"1st: {aa} {a1}–{h1} {ha} · {clock_txt}" if p1 else "No 1st-period data yet")
+        p1_proj = f"1st: {aa} {sim['p1_a']:.2f} – {sim['p1_h']:.2f} {ha}"
+        base = {"kind": "Game", "game": game_lbl, "time": g["time"], "now": p1_now}
+
+        bid = f"{gid}-P1TOT"
+        ov = bet_overrides.get(bid, {})
+        dk_p1t = dk.get("p1total", {}).get((aa, ha))
+        line = ov.get("line", (dk_p1t or {}).get("line") or 1.5)
+        p_o, p_u, _ = pmf_over_under(sim["p1_pmf"], line)
+        side, p, odds, imp, edge, src = price_pick(p_o, p_u, line, ov, dk_p1t)
+        status = grade_count(side, line, a1 + h1, p1_done, f1)[0] if (p1 or f1 is None) else "na"
+        bets.append({**base, "id": bid, "market": "P1 Total", "pick": f"{game_lbl} 1st period {side[0]} {line:g}",
+                     "p": p, "odds": odds, "imp": imp, "edge": edge, "src": src, "line": line,
+                     "line_txt": f"1st period {side} {line:g}", "proj_txt": f"{sim['p1_tot']:.2f} 1st-period goals",
+                     "status": status})
+        if dk_p1t and dk_p1t.get("line") is not None:
+            tl = dk_p1t["line"]
+            to, tu, _ = pmf_over_under(sim["p1_pmf"], tl)
+            v = value_side([(f"{game_lbl} 1st period O {tl:g}", "Over", to, dk_p1t.get("over"), dk_p1t.get("under")),
+                            (f"{game_lbl} 1st period U {tl:g}", "Under", tu, dk_p1t.get("under"), dk_p1t.get("over"))])
+            if v:
+                vs = grade_count(v["side"], tl, a1 + h1, p1_done, f1)[0] if (p1 or f1 is None) else "na"
+                add_value(v, {**base, "market": "P1 Total", "status": vs,
+                              "proj_txt": f"{sim['p1_tot']:.2f} 1st-period goals"})
+
+        bid = f"{gid}-P1ML"
+        ov = bet_overrides.get(bid, {})
+        dk_p1m = dk.get("p1ml", {}).get((aa, ha), {})
+        outcomes = [(aa, sim["p1_a_win"]), (ha, sim["p1_h_win"]), ("TIE", sim["p1_tie"])]
+        pick, p = max(outcomes, key=lambda o: o[1])
+        if "odds" in ov:
+            odds, imp, src = ov["odds"], american_to_prob(ov["odds"]), "Manual"
+        else:
+            odds, imp, src = dk_p1m.get(pick), implied_3way(dk_p1m, pick), "DK"
+        def p1_lbl(k):
+            return f"1st period tie ({game_lbl})" if k == "TIE" else f"{k} wins 1st period ({game_lbl})"
+        status = p1_ml_status(pick, aa, a1, h1, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
+        bets.append({**base, "id": bid, "market": "P1 ML", "pick": p1_lbl(pick), "p": p, "odds": odds, "imp": imp,
+                     "edge": (p - imp) * 100 if imp else None, "src": src, "line": None, "line_txt": "1st period 3-way",
+                     "proj_txt": p1_proj, "status": status})
+        v = value_side([(p1_lbl(k), k, pk, dk_p1m.get(k), None, implied_3way(dk_p1m, k)) for k, pk in outcomes])
+        if v:
+            vs = p1_ml_status(v["side"], aa, a1, h1, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
+            add_value(v, {**base, "market": "P1 ML", "status": vs, "proj_txt": p1_proj})
+
+        bid = f"{gid}-F10"
+        ov = bet_overrides.get(bid, {})
+        dk_f10 = dk.get("f10", {}).get((aa, ha))
+        side, p, odds, imp, edge, src = price_pick(sim["f10"], 1 - sim["f10"], 0.5, ov, dk_f10)
+        first = p1["first"] if p1 else None
+        def f10_lbl(sd):
+            return f"{game_lbl} goal in first 10 min: {'Yes' if sd == 'Over' else 'No'}"
+        status = f10_status(side, first, p1_mins, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
+        f10_proj = f"{sim['f10']*100:.0f}% chance of a goal by 10:00"
+        bets.append({**base, "id": bid, "market": "F10", "pick": f10_lbl(side), "p": p, "odds": odds, "imp": imp,
+                     "edge": edge, "src": src, "line": 0.5, "line_txt": "Goal in first 10 min",
+                     "proj_txt": f10_proj, "status": status})
+        if dk_f10:
+            v = value_side([(f10_lbl("Over"), "Over", sim["f10"], dk_f10.get("over"), dk_f10.get("under")),
+                            (f10_lbl("Under"), "Under", 1 - sim["f10"], dk_f10.get("under"), dk_f10.get("over"))])
+            if v:
+                vs = f10_status(v["side"], first, p1_mins, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
+                add_value(v, {**base, "market": "F10", "status": vs, "proj_txt": f10_proj})
+
+        for mkt, cands in p1_extra_cands(aa, ha, sim, dk, game_lbl).items():
+            v = value_side(cands)
+            if v:
+                vs = (p1_extra_status(mkt, v["side"], aa, a1, h1, p1_done) if f1 is not None and p1
+                      else ("pregame" if f1 is None else "na"))
+                add_value(v, {**base, "market": mkt, "status": vs, "proj_txt": p1_proj})
+                bets.append({**base, "id": f"{gid}-{mkt}", "market": mkt, "pick": v["pick"], "p": v["p"],
+                             "odds": v["odds"], "imp": v["imp"], "edge": v["edge"], "src": "DK", "line": None,
+                             "line_txt": "1st period puck line" if mkt == "P1 PL" else "1st period tie no bet",
+                             "proj_txt": p1_proj, "status": vs})
+
         # Players
         box = boxes.get(gid)
         actual = parse_box_players(box) if box else {}
@@ -1486,11 +1789,11 @@ def best_bets_section(values):
         st.info("No DraftKings lines for this date yet. Send DK screenshots (or add ODDS_API_KEY) and the best bets show here.")
         return
     c1, c2, c3 = st.columns(3)
-    mkts = c1.selectbox("Market", ["All", "Games", "SOG", "Points", "Goals"], key="best_mkt")
+    mkts = c1.selectbox("Market", ["All", "Games", "1st period", "SOG", "Points", "Goals"], key="best_mkt")
     min_edge = c2.selectbox("Min edge", [2, 3, 5, 8], index=1, key="best_edge")
     n_best = c3.selectbox("Show", [5, 10, 20], index=1, key="best_n")
     long_shots = st.toggle("Include long shots (model under 35%)", value=False, key="best_long")
-    want = {"Games": ("ML", "Total"), "SOG": ("SOG",), "Points": ("Pts",), "Goals": ("Goal",)}.get(mkts)
+    want = {"Games": ("ML", "Total"), "1st period": P1_MARKETS, "SOG": ("SOG",), "Points": ("Pts",), "Goals": ("Goal",)}.get(mkts)
     rows = [v for v in values
             if v["edge"] >= min_edge and (long_shots or v["p"] >= 0.35) and (want is None or v["market"] in want)]
     rows.sort(key=lambda v: v["edge"], reverse=True)
@@ -1502,7 +1805,9 @@ def best_bets_section(values):
     rec = f" · {sum(v['status'] == 'hit' for v in settled)}-{sum(v['status'] == 'miss' for v in settled)} settled" if settled else ""
     st.caption(f"Either side of every DK line, ranked by edge (model % minus DK's no-vig %). EV = expected profit per $100{rec}.")
     st_html(best_bets_card(rows))
-    st.caption("Anytime goal has no DK 'no' price, so its edge is vs DK's price with the vig left in. "
+    st.caption("1st-period picks are noisier: few goals, so one bounce decides them, and the model's period split "
+               "is a league average, not team-specific. "
+               "Anytime goal has no DK 'no' price, so its edge is vs DK's price with the vig left in. "
                "A huge edge usually means the model is missing news (injury, scratch, line change), so check before betting.")
 
 
@@ -1520,7 +1825,7 @@ with tab_bets:
 
     st.subheader("📋 All picks")
     c1, c2 = st.columns(2)
-    bet_kind = c1.radio("Show", ["All", "Games", "Players"], horizontal=True, key="bets_kind")
+    bet_kind = c1.radio("Show", ["All", "Games", "1st period", "Players"], horizontal=True, key="bets_kind")
     min_p = c2.slider("Min model %", 50, 80, 55, step=1, key="bets_min_p")
     c3, c4 = st.columns(2)
     n_show = c3.selectbox("How many", [15, 25, 50, 100], index=1, key="bets_n")
@@ -1528,7 +1833,10 @@ with tab_bets:
 
 
     def keep(b):
-        if bet_kind == "Games" and b["kind"] != "Game":
+        is_p1 = b["market"] in P1_MARKETS
+        if bet_kind == "Games" and (b["kind"] != "Game" or is_p1):
+            return False
+        if bet_kind == "1st period" and not is_p1:
             return False
         if bet_kind == "Players" and b["kind"] != "Player":
             return False
@@ -1668,7 +1976,13 @@ with tab_live:
                 ag, hg = resolve_goalie(g, "away", use_override=False), resolve_goalie(g, "home", use_override=False)
                 sim = model.simulate_game(aa, ha, ag, hg)
                 with st.expander(live_label(g, box, status), expanded=live_open):
-                    st_html(live_card(g, box, status, sim, dk_lines))
+                    p1 = None
+                    if status["kind"] != "sched":
+                        try:
+                            p1 = p1_result(load_landing(g["id"]), aa, ha)
+                        except Exception:  # noqa: BLE001
+                            p1 = None
+                    st_html(live_card(g, box, status, sim, dk_lines, p1))
                     if box and status["kind"] != "sched":
                         actual = parse_box_players(box)
                         a_df = model.project_skaters(aa, ha, False, hg["adj60"], apply_b2b=False, player_ids=dressed_ids(box, "awayTeam"))
@@ -1738,6 +2052,38 @@ def grade_best_bets(season, date_str, today_str):
                             (f"{game_lbl} U {tl:g}", "Under", tu, tot.get("under"), tot.get("over"))])
             if v:
                 add(v, "Total", grade_count(v["side"], tl, a_sc + h_sc, True, 1.0)[0])
+        p1t, p1m, f10 = dk["p1total"].get((aa, ha)), dk["p1ml"].get((aa, ha), {}), dk["f10"].get((aa, ha))
+        p1 = None
+        extra = p1_extra_cands(aa, ha, sim, dk, game_lbl)
+        if p1t or p1m or f10 or extra:
+            try:
+                p1 = p1_result(load_landing(g["id"]), aa, ha)
+            except Exception:  # noqa: BLE001
+                p1 = None
+        if p1:
+            a1, h1 = p1["a1"], p1["h1"]
+            if p1t and p1t.get("line") is not None:
+                tl = p1t["line"]
+                q_o, q_u, _ = pmf_over_under(sim["p1_pmf"], tl)
+                v = value_side([(f"{game_lbl} 1st period O {tl:g}", "Over", q_o, p1t.get("over"), p1t.get("under")),
+                                (f"{game_lbl} 1st period U {tl:g}", "Under", q_u, p1t.get("under"), p1t.get("over"))])
+                if v:
+                    add(v, "P1 Total", grade_count(v["side"], tl, a1 + h1, True, 1.0)[0])
+            if p1m:
+                outs = [(aa, sim["p1_a_win"]), (ha, sim["p1_h_win"]), ("TIE", sim["p1_tie"])]
+                v = value_side([(f"{'1st period tie' if k == 'TIE' else k + ' wins 1st period'} ({game_lbl})", k, pk,
+                                 p1m.get(k), None, implied_3way(p1m, k)) for k, pk in outs])
+                if v:
+                    add(v, "P1 ML", p1_ml_status(v["side"], aa, a1, h1, True))
+            if f10:
+                v = value_side([(f"{game_lbl} goal in first 10 min: Yes", "Over", sim["f10"], f10.get("over"), f10.get("under")),
+                                (f"{game_lbl} goal in first 10 min: No", "Under", 1 - sim["f10"], f10.get("under"), f10.get("over"))])
+                if v:
+                    add(v, "F10", f10_status(v["side"], p1["first"], 20.0, True))
+            for mkt, cands in extra.items():
+                v = value_side(cands)
+                if v:
+                    add(v, mkt, p1_extra_status(mkt, v["side"], aa, a1, h1, True))
         actual = parse_box_players(box)
         for df, team in ((df_a, aa), (df_h, ha)):
             for _, r in df.iterrows():
