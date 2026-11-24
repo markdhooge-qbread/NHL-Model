@@ -1679,7 +1679,164 @@ with tab_live:
 
     live_tracker()
 
+def units_won(odds, result):
+    """Profit in units on a 1-unit flat stake."""
+    if result == "hit":
+        return odds / 100.0 if odds > 0 else 100.0 / abs(odds)
+    return -1.0 if result == "miss" else 0.0
+
+
+@st.cache_data(ttl=900, show_spinner="Grading best bets against that day's DK lines...")
+def grade_best_bets(season, date_str, today_str):
+    """Every DK-priced market on a past slate: the side with the biggest edge vs DK, graded on the final box score."""
+    dk, n = load_file_lines(date_str)
+    if not n:
+        return pd.DataFrame()
+    teams_df, goalies_df, skaters_df = load_moneypuck(season)
+    day = datetime.date.fromisoformat(date_str)
+    prev = (day - datetime.timedelta(days=1)).isoformat()
+    m = Model(teams_df, goalies_df, skaters_df, teams_played_on(load_schedule(prev), prev))
+    rows = []
+    for g in games_on(load_schedule(date_str), date_str):
+        try:
+            box = (load_boxscore if date_str >= today_str else load_final_boxscore)(g["id"])
+        except Exception:  # noqa: BLE001
+            continue
+        if box.get("gameState") not in FINAL_STATES:
+            continue
+        aa, ha = g["away"], g["home"]
+        a_sc = box.get("awayTeam", {}).get("score") or 0
+        h_sc = box.get("homeTeam", {}).get("score") or 0
+        game_lbl = f"{aa} @ {ha}"
+        try:
+            ag = m.get_goalie(aa, goalie_id=starter_goalie_id(box, "awayTeam"))
+            hg = m.get_goalie(ha, goalie_id=starter_goalie_id(box, "homeTeam"))
+            sim = m.simulate_game(aa, ha, ag, hg)
+            df_a = m.project_skaters(aa, ha, False, hg["adj60"], player_ids=dressed_ids(box, "awayTeam"))
+            df_h = m.project_skaters(ha, aa, True, ag["adj60"], player_ids=dressed_ids(box, "homeTeam"))
+        except Exception:  # noqa: BLE001
+            continue
+
+        def add(v, market, result):
+            if v:
+                rows.append({"date": date_str, "game": game_lbl, "market": market, "pick": v["pick"],
+                             "p": v["p"], "odds": v["odds"], "imp": v["imp"], "edge": v["edge"],
+                             "result": result, "units": units_won(v["odds"], result)})
+
+        ml = dk["ml"].get((aa, ha), {})
+        v = value_side([(f"{aa} ML", aa, sim["a_win"], ml.get(aa), ml.get(ha)),
+                        (f"{ha} ML", ha, sim["h_win"], ml.get(ha), ml.get(aa))])
+        if v:
+            won = aa if a_sc > h_sc else ha
+            v["pick"] = f"{v['pick']} ({game_lbl})"
+            add(v, "ML", "hit" if v["side"] == won else "miss")
+        tot = dk["total"].get((aa, ha))
+        if tot and tot.get("line") is not None:
+            tl = tot["line"]
+            to, tu, _ = pmf_over_under(sim["tot_pmf"], tl)
+            v = value_side([(f"{game_lbl} O {tl:g}", "Over", to, tot.get("over"), tot.get("under")),
+                            (f"{game_lbl} U {tl:g}", "Under", tu, tot.get("under"), tot.get("over"))])
+            if v:
+                add(v, "Total", grade_count(v["side"], tl, a_sc + h_sc, True, 1.0)[0])
+        actual = parse_box_players(box)
+        for df, team in ((df_a, aa), (df_h, ha)):
+            for _, r in df.iterrows():
+                act = actual.get(r["playerId"])
+                if act is None:
+                    continue
+                for mkt, key, cur in (("SOG", "sog", act["sog"]), ("Pts", "pts", act["pts"]), ("Goal", "xg", act["g"])):
+                    dk_p = dk_player(dk, r["name"], mkt, (aa, ha))
+                    if not dk_p or dk_p.get("line") is None:
+                        continue
+                    dl = dk_p["line"]
+                    vo, vu, _ = line_probs(float(r[key]), dl)
+                    who = f"{r['name']} ({team})"
+                    if mkt == "Goal":
+                        cands = [(f"{who} anytime goal", "Over", vo, dk_p.get("over"), dk_p.get("under"))]
+                    else:
+                        cands = [(f"{who} O {dl:g} {mkt}", "Over", vo, dk_p.get("over"), dk_p.get("under")),
+                                 (f"{who} U {dl:g} {mkt}", "Under", vu, dk_p.get("under"), dk_p.get("over"))]
+                    v = value_side(cands)
+                    if v:
+                        add(v, mkt, grade_count(v["side"], dl, cur, True, 1.0)[0])
+    return pd.DataFrame(rows)
+
+
+def lines_dates():
+    try:
+        names = os.listdir(LINES_DIR)
+    except OSError:
+        return []
+    return sorted((n[:-4] for n in names if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", n)), reverse=True)
+
+
+def best_bets_record_section(today):
+    st_html("<div class='section'>🔥 Best bets record vs DK</div>")
+    dates = [d for d in lines_dates() if d <= today.isoformat()]
+    if not dates:
+        st.info("No DK lines files yet. Once a slate with DK lines finishes, its best bets are graded here.")
+        return
+    c1, c2, c3 = st.columns(3)
+    min_edge = c1.selectbox("Min edge", [2, 3, 5, 8], index=1, key="rec_best_edge")
+    top_n = c2.selectbox("Top per day", [5, 10, 20, "All"], index=1, key="rec_best_n")
+    long_shots = c3.toggle("Long shots", value=False, key="rec_best_long")
+    frames = []
+    for d in dates[:30]:
+        try:
+            df = grade_best_bets(SEASON, d, today.isoformat())
+        except Exception:  # noqa: BLE001
+            continue
+        if df.empty:
+            continue
+        df = df[(df["edge"] >= min_edge) & (long_shots | (df["p"] >= 0.35))].sort_values("edge", ascending=False)
+        frames.append(df if top_n == "All" else df.head(int(top_n)))
+    graded = pd.concat(frames) if frames else pd.DataFrame()
+    if graded.empty:
+        st.info("No finished slates with DK lines clear these filters yet. Tonight's games are graded once they're final.")
+        return
+    w, l = int((graded["result"] == "hit").sum()), int((graded["result"] == "miss").sum())
+    pushes = int((graded["result"] == "push").sum())
+    units = graded["units"].sum()
+    c1, c2 = st.columns(2)
+    c1.metric("Record", f"{w}-{l}" + (f"-{pushes}" if pushes else ""),
+              f"{w / max(w + l, 1) * 100:.0f}% hit · model expected {graded['p'].mean()*100:.0f}%", delta_color="off")
+    c2.metric("Units (1u flat)", f"{units:+.2f}u", f"ROI {units / len(graded) * 100:+.1f}% on {len(graded)} bets", delta_color="off")
+    by_mkt = ""
+    for mkt, sub in graded.groupby("market"):
+        sw, sl = int((sub["result"] == "hit").sum()), int((sub["result"] == "miss").sum())
+        by_mkt += (f"<tr><td>{mkt}</td><td>{sw}-{sl}</td><td>{sub['p'].mean()*100:.0f}%</td>"
+                   f"<td><b>{sub['units'].sum():+.2f}u</b></td></tr>")
+    by_day = ""
+    for d, sub in graded.groupby("date", sort=False):
+        sw, sl = int((sub["result"] == "hit").sum()), int((sub["result"] == "miss").sum())
+        by_day += f"<tr><td>{d[5:]}</td><td>{sw}-{sl}</td><td><b>{sub['units'].sum():+.2f}u</b></td></tr>"
+    st_html(f"""
+    <div class='card'><div class='tbl-wrap'><table class='tbl'>
+      <tr><th>Market</th><th>W-L</th><th>Avg model %</th><th>Units</th></tr>{by_mkt}
+    </table></div></div>
+    <div class='card'><div class='tbl-wrap'><table class='tbl'>
+      <tr><th>Slate</th><th>W-L</th><th>Units</th></tr>{by_day}
+    </table></div></div>
+    """)
+    picks = "".join(
+        f"<tr><td>{STATUS_ICON[r['result']]} <b>{r['pick']}</b><br><span class='card-sub'>{r['date'][5:]}</span></td>"
+        f"<td>{fmt_odds(int(r['odds']))}</td><td>{r['p']*100:.0f}% <span class='card-sub'>vs {r['imp']*100:.0f}%</span></td>"
+        f"<td>{r['edge']:+.1f}<br><span class='card-sub'>{r['units']:+.2f}u</span></td></tr>"
+        for _, r in graded.iterrows())
+    with st.expander(f"All {len(graded)} graded best bets"):
+        st_html(f"""
+        <div class='card'><div class='tbl-wrap'><table class='tbl'>
+          <tr><th>Pick</th><th>DK</th><th>Model vs DK</th><th>Edge / result</th></tr>{picks}
+        </table></div></div>
+        """)
+    st.caption("Same picks the Best bets board would show, graded against the DK lines saved for each day. "
+               "Projections use today's season stats and the confirmed goalies and lineups, so this runs a bit optimistic.")
+    st.divider()
+
+
 with tab_rec:
+    best_bets_record_section(est_now.date())
+
     # -- Daily top-50 player review ---------------------------------------
     st_html("<div class='section'>📋 Daily top 50: projected points vs. actual</div>")
     last_done = max(min(slate_date, est_now.date()) - datetime.timedelta(days=1), SEASON_START)
