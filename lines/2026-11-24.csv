@@ -22,7 +22,7 @@ VGK@EDM,PTS,Victor Olofsson,0.5,-110,-125
 VGK@EDM,PTS,Vasily Podkolzin,0.5,-105,-130
 VGK@EDM,PTS,Kasperi Kapanen,0.5,+125,-165
 VGK@EDM,PTS,Trevor Connelly,0.5,+130,-180
-VGK@EDM,PTS,William Karlsson,0.5,+140,
+VGK@EDM,PTS,William Karlsson,0.5,+140,-190
 VGK@EDM,SOG,Leon Draisaitl,3.5,+100,-135
 VGK@EDM,SOG,Connor McDavid,2.5,-135,+100
 VGK@EDM,SOG,Jack Eichel,2.5,-120,-115
@@ -37,3 +37,6 @@ VGK@EDM,SOG,Vasily Podkolzin,1.5,-140,+105
 VGK@EDM,SOG,Kasperi Kapanen,1.5,-115,-115
 VGK@EDM,SOG,Shea Theodore,1.5,+105,-140
 VGK@EDM,SOG,Ivan Barbashev,0.5,-230,+170
+VGK@EDM,PTS,Shea Theodore,0.5,+155,-210
+VGK@EDM,PTS,Ivan Barbashev,0.5,+170,-235
+VGK@EDM,PTS,Mattias Ekholm,0.5,+175,-235
