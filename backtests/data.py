@@ -32,12 +32,17 @@ GOALIE_COLS = ["playerId", "season", "name", "gameId", "playerTeam", "gameDate",
                "xGoals", "goals"]
 
 
-def _get(url, tries=4, timeout=120):
+def _get(url, tries=6, timeout=120):
+    """GET with retries. A 429 (MoneyPuck rate limit) waits for Retry-After, or 10s, 20s, 40s ..."""
     for i in range(tries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
             if r.status_code == 404:
                 return None
+            if r.status_code == 429 and i < tries - 1:
+                wait = r.headers.get("Retry-After", "")
+                time.sleep(int(wait) if wait.isdigit() else 10 * 2 ** i)
+                continue
             r.raise_for_status()
             return r
         except requests.RequestException:
@@ -75,18 +80,24 @@ def team_games(seasons, refresh=False):
     return df.reset_index(drop=True)
 
 
-def goalie_ids(season):
+def goalie_ids(season, refresh=False):
+    """Goalie ids in a season's MoneyPuck summary (cached)."""
+    f = _path("mp", f"goalie_ids_{season}.json")
+    if os.path.exists(f) and not refresh:
+        with open(f) as fh:
+            return json.load(fh)
     r = _get(f"{MP}/seasonSummary/{season}/regular/goalies.csv")
-    if r is None:
-        return []
-    return sorted(pd.read_csv(io.StringIO(r.text))["playerId"].unique().tolist())
+    ids = sorted(int(x) for x in pd.read_csv(io.StringIO(r.text))["playerId"].unique()) if r is not None else []
+    with open(f, "w") as fh:
+        json.dump(ids, fh)
+    return ids
 
 
 def goalie_games(seasons, refresh=False):
     """Goalie game rows (situation 'all') for the seasons. refresh=True refetches files older than 6 hours
     (for the season in progress)."""
     frames = []
-    ids = sorted({pid for s in seasons for pid in goalie_ids(s)})
+    ids = sorted({pid for s in seasons for pid in goalie_ids(s, refresh=refresh)})
     for pid in ids:
         f = _path("mp", "goalies", f"{pid}.csv")
         stale = refresh and os.path.exists(f) and time.time() - os.path.getmtime(f) > 6 * 3600
@@ -96,7 +107,7 @@ def goalie_games(seasons, refresh=False):
                 continue
             with open(f, "w") as fh:
                 fh.write(r.text)
-            time.sleep(0.2)
+            time.sleep(0.5)  # be polite: MoneyPuck rate-limits bursts
         g = pd.read_csv(f, usecols=lambda c: c in GOALIE_COLS)
         frames.append(g[(g["situation"] == "all") & g["season"].isin(seasons)])
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=GOALIE_COLS)
@@ -164,3 +175,12 @@ def nhl_results(season, today=None):
         rows += parse_score_day(js, ds)
     df = pd.DataFrame(rows)
     return df.drop_duplicates("id").sort_values(["date", "id"]).reset_index(drop=True) if len(df) else df
+
+
+def prefetch(seasons, current=None, today=None):
+    """Download everything once, one request at a time, so parallel workers only read the cache."""
+    team_games(seasons)
+    for s in sorted(set(seasons) | {min(seasons) - 1}):
+        nhl_results(s, today)
+    for s in seasons:
+        goalie_games([s], refresh=(s == current))

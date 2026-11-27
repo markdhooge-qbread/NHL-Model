@@ -182,8 +182,7 @@ def _season_job(args):
     results = data.nhl_results(season, today)
     prev = data.nhl_results(season - 1, today)
     tg = data.team_games([season])
-    current = season >= today.year - (1 if today.month < 9 else 0)
-    gg = data.goalie_games([season], refresh=current)
+    gg = data.goalie_games([season])  # prefetch() already refreshed the season in progress
     return run_season(season, results, prev, tg, gg, var_list, n_sims)
 
 
@@ -479,7 +478,7 @@ def main(argv=None):
     var_list = variants(grid)
     seasons = a.tune + [a.holdout] + ([a.current] if a.current else [])
     today = datetime.date.today()
-    data.team_games(seasons)  # one download, shared by the workers through the cache
+    data.prefetch(seasons, current=a.current or None, today=today)  # serial downloads; workers read the cache
     with ProcessPoolExecutor(max_workers=min(a.workers, len(seasons))) as ex:
         parts = list(ex.map(_season_job, [(s, var_list, n_sims, today) for s in seasons]))
     df = pd.concat([p[0] for p in parts], ignore_index=True)
