@@ -390,7 +390,10 @@ def write_report(df, pmfs, grid, tune, holdout, current, min_gp, n_sims, lines_p
              "actual": ((allv["a_goals"] == 0) | (allv["h_goals"] == 0)).mean()},
             {"event": "7+ total goals", "forecast": allv["p7"].mean(), "actual": ((allv["a_goals"] + allv["h_goals"]) >= 7).mean()},
             {"event": "Goes past regulation", "forecast": np.nan, "actual": (allv["last"] != "REG").mean()},
+            {"event": "Average total goals", "forecast": allv["proj_tot"].mean(),
+             "actual": (allv["a_goals"] + allv["h_goals"]).mean()},
         ])
+        tails.to_csv(os.path.join(out, "goal_tails.csv"), index=False)
         L.append("## 3. Goal-total distribution, all seasons\n\nShare of games with each final total (shootout winner counts as a goal, like the books).\n")
         L.append(md_table(dist, ["total", "forecast", "actual"], ["Total", "Forecast", "Actual"]) + "\n")
         L.append(md_table(tails, ["event", "forecast", "actual"], ["Event", "Forecast", "Actual"]) + "\n")
