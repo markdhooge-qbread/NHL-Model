@@ -120,3 +120,8 @@ def test_recommend_rule():
     ])
     r = rb.recommend(pt).set_index("param")["recommendation"]
     assert r["x"].startswith("Evidence") and r["y"].startswith("Weak") and r["z"].startswith("Keep")
+
+
+def test_backup_params_use_the_actual_starter():
+    v = {x[0]: x for x in rb.variants(rb.GRID)}
+    assert v["backup_drag=0"][4] == "actual" and v["gamma_shape=6"][4] == "assumed"

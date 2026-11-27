@@ -47,6 +47,10 @@ QUICK_GRID = {k: v for k, v in GRID.items() if k in ("gamma_shape", "home_ice", 
 LIVE = {"other_goals": 1.0, **{k: DEFAULT_PARAMS[k] for k in GRID if k in DEFAULT_PARAMS}}
 # The score each parameter is judged on, fixed up front: the thing the parameter is meant to move.
 PRIMARY = {"gamma_shape": "total_ll", "other_goals": "total_ll", "p1_share": "p1_ll", "f10_share": "f10_ll"}
+# Backup-goalie settings only matter when a backup starts, which the assumed-#1 run never has. They are
+# tested with the goalie who actually started, against the live values with that same goalie.
+ACTUAL_GOALIE = ("backup_prior", "backup_mean", "backup_drag")
+ACTUAL_REF = "goalie=actual starter"
 LOSSES = ["win_ll", "win_brier", "o55_ll", "o65_ll", "total_ll", "p1_ll", "f10_ll"]
 LOSS_LABEL = {"win_ll": "win log loss", "win_brier": "win Brier", "o55_ll": "O/U 5.5 log loss",
               "o65_ll": "O/U 6.5 log loss", "total_ll": "exact-total log loss", "p1_ll": "1st-period goals log loss",
@@ -67,7 +71,8 @@ def variants(grid):
     for name, vals in grid.items():
         for v in vals:
             if not np.isclose(v, LIVE[name]):
-                out.append((f"{name}={v:g}", name, v, variant_params(name, v), "assumed"))
+                out.append((f"{name}={v:g}", name, v, variant_params(name, v),
+                            "actual" if name in ACTUAL_GOALIE else "assumed"))
     return out
 
 
@@ -268,19 +273,25 @@ def param_table(d, grid):
     rows = []
     for name, vals in grid.items():
         loss = PRIMARY.get(name, "win_ll")
+        ref = ACTUAL_REF if name in ACTUAL_GOALIE else "live"
         for v in vals:
-            lbl = "live" if np.isclose(v, LIVE[name]) else f"{name}={v:g}"
-            row = {"param": name, "value": v, "live": lbl == "live", "judged_on": loss}
+            is_live = bool(np.isclose(v, LIVE[name]))
+            lbl = ref if is_live else f"{name}={v:g}"
+            row = {"param": name, "value": v, "live": is_live, "judged_on": loss}
             for split in ("tuning", "held-out"):
                 sub = d[(d["split"] == split) & (d["variant"] == lbl)]
                 row[f"{split}_{loss}"] = sub[loss].mean() if len(sub) else np.nan
-                if lbl != "live":
-                    mean, se, n = diff_vs(d, split, lbl, "live", loss)
+                if not is_live:
+                    mean, se, n = diff_vs(d, split, lbl, ref, loss)
                     row[f"{split}_diff"], row[f"{split}_se"] = mean, se
                 else:
                     row[f"{split}_diff"], row[f"{split}_se"] = 0.0, 0.0
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+def vlabel(v):
+    return "Poisson" if v >= 1e5 else f"{v:g}"
 
 
 def recommend(pt):
@@ -296,11 +307,11 @@ def recommend(pt):
         b = cand.iloc[0]
         hd, hse = b["held-out_diff"], b["held-out_se"]
         if hd < 0 and hse > 0 and -hd > 2 * hse:
-            rec = f"Evidence for {b['value']:g}: better on tuning and on the held-out season by more than 2 SE. Your call."
+            rec = f"Evidence for {vlabel(b['value'])}: better on tuning and on the held-out season by more than 2 SE. Your call."
         elif hd < 0:
-            rec = f"Weak: {b['value']:g} was a little better on both, but within noise. Keep."
+            rec = f"Weak: {vlabel(b['value'])} was a little better on both, but within noise. Keep."
         else:
-            rec = f"Keep: {b['value']:g} won on tuning but not on the held-out season."
+            rec = f"Keep: {vlabel(b['value'])} won on tuning but not on the held-out season."
         out.append({"param": name, "live": live_v, "best_on_tuning": b["value"], "held_out_change": hd,
                     "held_out_se": hse, "recommendation": rec})
     return pd.DataFrame(out)
@@ -432,7 +443,9 @@ def write_report(df, pmfs, grid, tune, holdout, current, min_gp, n_sims, lines_p
     L.append("## 6. Parameters, one at a time\n\nEach row moves one parameter, everything else at the live value. "
              "Diff = change in the judged score vs live (negative = better), with its standard error. "
              "Rule set before running: suggest a change only if the best tuning value also beats live on the "
-             "held-out season by more than 2 SE. **No live parameter was changed.**\n")
+             "held-out season by more than 2 SE. The backup-goalie rows use the goalie who actually started "
+             "(otherwise no backup ever plays). Moving one parameter at a time can't separate parameters that "
+             "push the same way. **No live parameter was changed.**\n")
     show = pt.copy()
     show["value"] = [("Poisson" if v >= 1e5 else f"{v:g}") + (" (live)" if lv else "") for v, lv in zip(show["value"], show["live"])]
     show["judged_on"] = show["judged_on"].map(LOSS_LABEL)
