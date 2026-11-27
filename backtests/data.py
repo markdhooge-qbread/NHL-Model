@@ -21,7 +21,7 @@ import requests
 
 MP = "https://moneypuck.com/moneypuck/playerData"
 NHL_API = "https://api-web.nhle.com/v1"
-HEADERS = {"User-Agent": "Mozilla/5.0 (nhl-model backtest)"}
+HEADERS = {"User-Agent": "Mozilla/5.0"}  # same as the app; MoneyPuck turns away unusual agents
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 
 TEAM_COLS = ["season", "gameId", "playerTeam", "opposingTeam", "home_or_away", "gameDate", "situation", "iceTime",
@@ -63,6 +63,9 @@ def team_games(seasons, refresh=False):
             df = None
     if df is None:
         r = _get(f"{MP}/careers/gameByGame/all_teams.csv", timeout=600)
+        head = r.content[:300].decode("utf-8", "ignore")
+        if "season" not in head.split("\n")[0]:
+            raise RuntimeError(f"MoneyPuck all_teams.csv didn't come back as the CSV (got: {head[:120]!r})")
         df = pd.read_csv(io.BytesIO(r.content), usecols=lambda c: c in TEAM_COLS)
         df = df[df["season"] >= min(seasons)]
         df.to_pickle(pkl)
