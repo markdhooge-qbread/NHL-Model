@@ -13,12 +13,12 @@ N_SIMS = 10_000
 MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
 
 DEFAULT_PARAMS = {
-    "gamma_shape": 18.0,      # Gamma-Poisson dispersion of regulation goals (higher = closer to Poisson)
+    "gamma_shape": 30.0,      # Gamma-Poisson dispersion of regulation goals (higher = closer to Poisson). 18 until Nov 27 2026; backtest
     "b2b_off": 0.94,          # 6% offensive drag for a team on a back-to-back
     "b2b_def": 1.04,          # 4% defensive fatigue penalty (opponent of a B2B team gains)
     "home_ice": 0.035,        # home 5v5 rate x (1 + this), away x (1 - this): 1.035 / 0.965
-    "other_a": 0.16,          # away goals not in 5v5 or 5v4 xG (4v4, 3v3, empty net, 5v3 ...)
-    "other_h": 0.18,          # same for the home team
+    "other_a": 0.24,          # away goals not in 5v5 or 5v4 xG (4v4, 3v3, empty net, 5v3 ...). Was 0.16; backtest
+    "other_h": 0.27,          # same for the home team. Was 0.18
     "lam_floor": 0.8,         # minimum team lambda
     "ot_xg_weight": 0.60,     # OT/SO: away win chance = weight x away 5v5 xG share + base
     "ot_base": 0.20,

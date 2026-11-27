@@ -76,13 +76,13 @@ def test_variants_include_live_once_and_respect_pairs():
     v = rb.variants(rb.GRID)
     labels = [x[0] for x in v]
     assert labels[0] == "live" and len(labels) == len(set(labels))
-    assert not any(lbl == "gamma_shape=18" for lbl in labels)
-    assert rb.variant_params("other_goals", 0.5) == {"other_a": 0.08, "other_h": 0.09}
+    assert not any(lbl == "gamma_shape=30" for lbl in labels)  # the live value runs as "live"
+    assert rb.variant_params("other_goals", 0.5) == {"other_a": 0.12, "other_h": 0.135}
     assert rb.variant_params("ot_xg_weight", 0.6) == {"ot_xg_weight": 0.6, "ot_base": 0.2}
 
 
 def test_end_to_end_on_a_synthetic_season(tmp_path):
-    grid = {"gamma_shape": [6.0, 18.0], "home_ice": [0.0, 0.035]}
+    grid = {"gamma_shape": [6.0, 30.0], "home_ice": [0.0, 0.035]}
     vl = rb.variants(grid)
     parts = []
     for season in (2022, 2023):
@@ -125,3 +125,9 @@ def test_recommend_rule():
 def test_backup_params_use_the_actual_starter():
     v = {x[0]: x for x in rb.variants(rb.GRID)}
     assert v["backup_drag=0"][4] == "actual" and v["gamma_shape=6"][4] == "assumed"
+
+
+def test_live_parameters_approved_nov_27():
+    from model_core import DEFAULT_PARAMS as P
+    assert (P["gamma_shape"], P["other_a"], P["other_h"]) == (30.0, 0.24, 0.27)  # changes 1 and 2, approved by Mark
+    assert (P["backup_prior"], P["backup_mean"], P["backup_drag"]) == (20.0, -0.18, -0.10)  # change 3 not approved
