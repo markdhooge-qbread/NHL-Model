@@ -34,7 +34,7 @@ GRID = {
     "b2b_off": [0.90, 0.94, 0.97, 1.00],
     "b2b_def": [1.00, 1.02, 1.04, 1.06],
     "home_ice": [0.0, 0.02, 0.035, 0.05],
-    "other_goals": [0.0, 0.5, 1.0, 1.5],     # multiplier on the +0.16 away / +0.18 home "other goals"
+    "other_goals": [0.0, 0.5, 1.0, 1.5],     # multiplier on the live "other goals" (+0.24 away / +0.27 home)
     "ot_xg_weight": [0.0, 0.3, 0.6, 0.9],    # OT base = (1 - weight) / 2, so an even game stays 50/50
     "starter_prior": [5.0, 15.0, 30.0, 60.0],
     "backup_prior": [10.0, 20.0, 40.0],
@@ -403,6 +403,12 @@ def write_report(df, pmfs, grid, tune, holdout, current, min_gp, n_sims, lines_p
             {"event": "Goes past regulation", "forecast": np.nan, "actual": (allv["last"] != "REG").mean()},
             {"event": "Average total goals", "forecast": allv["proj_tot"].mean(),
              "actual": (allv["a_goals"] + allv["h_goals"]).mean()},
+            {"event": "Over 5.5 (forecast = average chance)", "forecast": allv["o55"].mean(),
+             "actual": ((allv["a_goals"] + allv["h_goals"]) > 5.5).mean()},
+            {"event": "Over 6.5 (forecast = average chance)", "forecast": allv["o65"].mean(),
+             "actual": ((allv["a_goals"] + allv["h_goals"]) > 6.5).mean()},
+            {"event": "Games the model leans under 5.5", "forecast": (allv["o55"] < 0.5).mean(), "actual": np.nan},
+            {"event": "Games the model leans under 6.5", "forecast": (allv["o65"] < 0.5).mean(), "actual": np.nan},
         ])
         tails.to_csv(os.path.join(out, "goal_tails.csv"), index=False)
         L.append("## 3. Goal-total distribution, all seasons\n\nShare of games with each final total (shootout winner counts as a goal, like the books).\n")
