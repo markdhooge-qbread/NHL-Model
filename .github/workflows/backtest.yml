@@ -1,0 +1,19 @@
+name: Backtest
+on:
+  push:
+    branches: ["claude/project-thread-pfntrm"]
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe data sources
+        run: |
+          for u in \
+            https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_teams.csv \
+            https://moneypuck.com/moneypuck/playerData/seasonSummary/2024/regular/goalies.csv \
+            https://moneypuck.com/moneypuck/playerData/careers/gameByGame/regular/goalies/8478406.csv \
+            "https://api-web.nhle.com/v1/score/2024-11-01" ; do
+            echo "== $u"; curl -sL -A "Mozilla/5.0" -m 120 -o /tmp/f -w '%{http_code} %{size_download}\n' "$u"; head -c 1500 /tmp/f; echo
+          done
+          curl -sL -A "Mozilla/5.0" https://moneypuck.com/moneypuck/playerData/careers/gameByGame/all_teams.csv | head -3
