@@ -21,6 +21,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
+import odds_feeds
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -44,6 +46,9 @@ GH_REPO = "markdhooge-qbread/NHL-Model"
 PICKS_BRANCH = "picks-data"      # snapshots live on their own branch so saving one doesn't redeploy the app
 PICKS_PATH = "picks/top_picks.csv"
 PICKS_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "picks", "top_picks.csv")
+AUTO_LINES_DIR = "lines/auto"     # free-feed pregame snapshots, also on the picks branch
+AUTO_LINES_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lines", "auto")
+FEED_TTL = 3600                  # refetch the free feeds at most hourly, and only for games not started
 PICK_COLS = ["date", "pick", "market", "game", "odds", "p", "imp", "edge", "saved_at"]
 TOP_MIN_EDGE, TOP_MIN_P = 3.0, 0.35  # same defaults as the Best bets board
 TEAM_ABBR = {
@@ -873,17 +878,14 @@ def _line(v):
 
 
 def empty_lines():
-    return {"ml": {}, "total": {}, "player": {}, "p1total": {}, "p1ml": {}, "f10": {}, "p1pl": {}, "p1tnb": {}}
+    # "src": (away, home, market) -> where that game's line came from (ESPN, DK, screenshot, Odds API)
+    return {"ml": {}, "total": {}, "player": {}, "p1total": {}, "p1ml": {}, "f10": {}, "p1pl": {}, "p1tnb": {},
+            "src": {}}
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_file_lines(date_str):
-    """DK lines transcribed into lines/{date}.csv (columns: game,market,player,line,over_odds,under_odds)."""
+def lines_from_df(df, default_src):
+    """Lines dict from rows in the lines-file format (game,market,player,line,over_odds,under_odds[,source])."""
     out = empty_lines()
-    path = os.path.join(LINES_DIR, f"{date_str}.csv")
-    if not os.path.exists(path):
-        return out, 0
-    df = pd.read_csv(path, dtype=str).fillna("")
     n = 0
     for _, r in df.iterrows():
         mkt = LINE_MARKETS.get(r.get("market", "").strip().upper())
@@ -891,6 +893,7 @@ def load_file_lines(date_str):
         away, _, home = game.partition("@")
         if not mkt:
             continue
+        n_before = n
         if mkt == "ML" and away and home:
             odds = _odds(r.get("over_odds"))
             if odds is not None:
@@ -933,7 +936,143 @@ def load_file_lines(date_str):
                 out["player"][(away, home, nm, mkt)] = rec
             out["player"].setdefault((nm, mkt), rec)
             n += 1
+        if n > n_before and away and home:
+            out["src"][(away, home, mkt)] = (r.get("source") or "").strip() or default_src
     return out, n
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_file_lines(date_str):
+    """DK lines transcribed from screenshots into lines/{date}.csv."""
+    path = os.path.join(LINES_DIR, f"{date_str}.csv")
+    if not os.path.exists(path):
+        return empty_lines(), 0
+    df = pd.read_csv(path, dtype=str).fillna("")
+    return lines_from_df(df.drop(columns=["source"], errors="ignore"), "screenshot")
+
+
+# ----------------------------------------------------------------------------
+# Free feeds (ESPN game lines, DK props), saved as a pregame snapshot per day
+# ----------------------------------------------------------------------------
+def _gh_token():
+    try:
+        return st.secrets.get("GITHUB_TOKEN")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _gh(method, path, token, **kw):
+    return requests.request(method, f"https://api.github.com/repos/{GH_REPO}/{path}", timeout=15,
+                            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, **kw)
+
+
+def _ensure_branch(token):
+    if _gh("GET", f"branches/{PICKS_BRANCH}", token).status_code == 200:
+        return
+    main_sha = _gh("GET", "git/ref/heads/main", token).json()["object"]["sha"]
+    _gh("POST", "git/refs", token, json={"ref": f"refs/heads/{PICKS_BRANCH}", "sha": main_sha})
+
+
+def _auto_path(date_str):
+    return f"{AUTO_LINES_DIR}/{date_str}.csv"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_auto_snapshot(token, date_str):
+    """Saved free-feed lines for a date: (DataFrame, sha). GitHub picks branch if a token is set, else local disk."""
+    text, sha = None, None
+    if token:
+        try:
+            r = _gh("GET", f"contents/{_auto_path(date_str)}", token, params={"ref": PICKS_BRANCH})
+            if r.status_code == 200:
+                j = r.json()
+                text, sha = base64.b64decode(j["content"]).decode(), j["sha"]
+        except Exception:  # noqa: BLE001
+            pass
+    local = os.path.join(AUTO_LINES_LOCAL, f"{date_str}.csv")
+    if text is None and os.path.exists(local):
+        with open(local) as f:
+            text = f.read()
+    df = pd.read_csv(io.StringIO(text), dtype=str).fillna("") if text else pd.DataFrame(columns=odds_feeds.ROW_COLS)
+    return df.reindex(columns=odds_feeds.ROW_COLS).fillna(""), sha
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def auto_snapshot_dates(token):
+    """Dates that have a saved free-feed snapshot."""
+    names = []
+    if token:
+        try:
+            r = _gh("GET", f"contents/{AUTO_LINES_DIR}", token, params={"ref": PICKS_BRANCH})
+            if r.status_code == 200:
+                names = [f["name"] for f in r.json() if isinstance(f, dict)]
+        except Exception:  # noqa: BLE001
+            pass
+    if os.path.isdir(AUTO_LINES_LOCAL):
+        names += os.listdir(AUTO_LINES_LOCAL)
+    return sorted({n[:-4] for n in names if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", n)})
+
+
+def save_auto_snapshot(date_str, df, sha):
+    """Write the day's snapshot. Returns None on success, else an error string."""
+    text = df.reindex(columns=odds_feeds.ROW_COLS).to_csv(index=False)
+    token, err = _gh_token(), None
+    if token:
+        try:
+            _ensure_branch(token)
+            body = {"message": f"Free-feed DK lines {date_str}", "branch": PICKS_BRANCH,
+                    "content": base64.b64encode(text.encode()).decode()}
+            if sha:
+                body["sha"] = sha
+            r = _gh("PUT", f"contents/{_auto_path(date_str)}", token, json=body)
+            if r.status_code not in (200, 201):
+                err = f"GitHub save failed ({r.status_code})"
+        except Exception as exc:  # noqa: BLE001
+            err = f"GitHub save failed ({exc})"
+    else:
+        err = "no GITHUB_TOKEN"
+    if err:
+        os.makedirs(AUTO_LINES_LOCAL, exist_ok=True)
+        with open(os.path.join(AUTO_LINES_LOCAL, f"{date_str}.csv"), "w") as f:
+            f.write(text)
+    load_auto_snapshot.clear()
+    auto_snapshot_dates.clear()
+    return err
+
+
+@st.cache_data(ttl=FEED_TTL, show_spinner="Fetching free DraftKings odds...")
+def fetch_free_feeds(date_str, bust=0):
+    """ESPN game lines and DK props. Cached an hour, so reloads don't refetch."""
+    espn_rows, espn_err = odds_feeds.fetch_espn(date_str)
+    dk_rows, dk_err = odds_feeds.fetch_dk_props(date_str)
+    return espn_rows, espn_err, dk_rows, dk_err, datetime.datetime.now(EST).strftime("%-I:%M %p ET")
+
+
+def auto_lines(date_str, games, now):
+    """Free-feed lines for the slate. Games not started yet take the latest fetch; a game that has
+    started keeps its last pregame lines, so live odds never replace them. A failed feed leaves the
+    saved lines alone. Returns (lines, count, status dict)."""
+    token = _gh_token()
+    snap, sha = load_auto_snapshot(token, date_str)
+    status = {"espn": None, "dk": None, "fetched": None, "saved": None}
+    starts = {f"{g['away']}@{g['home']}": g["start"] for g in games}
+    pregame = {k for k, t in starts.items() if t > now}
+    if pregame and date_str >= now.date().isoformat():
+        espn_rows, espn_err, dk_rows, dk_err, fetched = fetch_free_feeds(date_str, st.session_state.get("feed_bust", 0))
+        status.update(espn=espn_err or f"{len(espn_rows)} game prices", dk=dk_err or f"{len(dk_rows)} props",
+                      fetched=fetched)
+        fresh = pd.DataFrame([r for r in espn_rows + dk_rows if r["game"] in pregame], columns=odds_feeds.ROW_COLS)
+        if len(fresh):
+            # Replace, per game and source, only what the latest fetch actually returned.
+            got = set(zip(fresh["game"], fresh["source"]))
+            keep = snap[[(gm, sc) not in got for gm, sc in zip(snap["game"], snap["source"])]]
+            new = pd.concat([keep, fresh], ignore_index=True).sort_values(["game", "market", "player"]).reset_index(drop=True)
+            old = snap.sort_values(["game", "market", "player"]).reset_index(drop=True)
+            if not new.equals(old):
+                status["saved"] = save_auto_snapshot(date_str, new, sha) or "ok"
+                snap = new
+    lines, n = lines_from_df(snap, "feed")
+    return lines, n, status
 
 
 @st.cache_data(ttl=900, show_spinner="Fetching DraftKings odds...")
@@ -971,6 +1110,7 @@ def load_odds_api(api_key, date_str, include_props):
                         t["over" if o["name"] == "Over" else "under"] = int(o["price"])
                     out["total"][(away, home)] = t
                     n += 1
+        out["src"][(away, home, "ML")] = out["src"][(away, home, "TOT")] = "Odds API"
     if include_props:
         prop_map = {"player_shots_on_goal": "SOG", "player_points": "Pts", "player_goal_scorer_anytime": "Goal"}
         for eid, away, home in keep:
@@ -999,7 +1139,19 @@ def load_odds_api(api_key, date_str, include_props):
     return out, n, None
 
 
+def saved_lines(date_str):
+    """A past slate's pregame lines: the free-feed snapshot, with screenshot lines on top."""
+    file_l, n_file = load_file_lines(date_str)
+    try:
+        snap, _ = load_auto_snapshot(_gh_token(), date_str)
+        auto_l, n_auto = lines_from_df(snap, "feed")
+    except Exception:  # noqa: BLE001
+        auto_l, n_auto = empty_lines(), 0
+    return merge_lines(auto_l, file_l), n_file + n_auto
+
+
 def merge_lines(*sources):
+    """Later sources win where two have the same line."""
     out = empty_lines()
     for src in sources:
         for k in out:
@@ -1381,7 +1533,12 @@ def resolve_goalie(g, side, use_override=True):
     )
 
 
-# DraftKings lines: repo file for the date, then The Odds API if a key is set (API wins where both exist).
+# DraftKings lines: free feeds (ESPN game lines, DK props), then the screenshot lines file, then The Odds API
+# if a key is set. Later sources win where two have the same line, so screenshots fill or fix feed gaps.
+try:
+    auto, n_auto, feed_status = auto_lines(date_str, games, datetime.datetime.now(EST))
+except Exception as exc:  # noqa: BLE001
+    auto, n_auto, feed_status = empty_lines(), 0, {"espn": f"error ({exc})", "dk": None, "fetched": None, "saved": None}
 try:
     file_lines, n_file = load_file_lines(date_str)
 except Exception:  # noqa: BLE001
@@ -1391,17 +1548,54 @@ try:
 except Exception:  # noqa: BLE001
     odds_key = None
 api_lines, n_api, api_err = empty_lines(), 0, None
-with st.expander("📈 DraftKings lines"):
-    src_txt = [f"lines file: {n_file} lines" if n_file else "no lines file for this date"]
-    if odds_key:
-        want_props = st.toggle("Also fetch DK player props (uses more API credits)", value=True, key="odds_props")
-        api_lines, n_api, api_err = load_odds_api(odds_key, date_str, want_props)
-        src_txt.append(f"The Odds API: {n_api} prices" if not api_err else f"The Odds API error: {api_err}")
+dk_lines = merge_lines(auto, file_lines)
+
+
+def feed_ok(msg):
+    return bool(msg) and msg[0].isdigit()
+
+
+def lines_source_summary(dk):
+    """One row per game: where its game lines and props came from."""
+    rows = []
+    for g in games:
+        k = (g["away"], g["home"])
+        gsrc = sorted({dk["src"][(*k, m)] for m in ("ML", "TOT") if (*k, m) in dk["src"]})
+        psrc = sorted({dk["src"][(*k, m)] for m in ("SOG", "Pts", "Goal") if (*k, m) in dk["src"]})
+        n_props = sum(1 for key in dk["player"] if len(key) == 4 and key[:2] == k)
+        rows.append(f"<tr><td><b>{g['away']} @ {g['home']}</b></td>"
+                    f"<td>{' + '.join(gsrc) or 'NA'}</td>"
+                    f"<td>{(' + '.join(psrc) + f' ({n_props})') if psrc else 'NA'}</td></tr>")
+    return ("<div class='tbl-wrap'><table class='tbl'><tr><th>Game</th><th>ML / total</th><th>Props</th></tr>"
+            + "".join(rows) + "</table></div>")
+
+
+feeds_down = not (feed_ok(feed_status.get("espn")) and feed_ok(feed_status.get("dk")))
+lbl = "📈 DraftKings lines" + (" · ⚠️ screenshots needed" if feed_status.get("fetched") and feeds_down else "")
+with st.expander(lbl):
+    if feed_status.get("fetched"):
+        st.caption(f"Free feeds, checked {feed_status['fetched']} (refetched hourly until each game starts, "
+                   "then that game's pregame lines are kept)")
+        st_html(f"<div class='meta'>{'✅' if feed_ok(feed_status['espn']) else '❌'} Game lines from ESPN: "
+                f"{feed_status['espn']}<br>{'✅' if feed_ok(feed_status['dk']) else '❌'} Props from DraftKings: "
+                f"{feed_status['dk']}<br>📸 Screenshot file: {f'{n_file} lines' if n_file else 'none'}</div>")
+        if feed_status.get("saved") not in (None, "ok", "no GITHUB_TOKEN"):
+            st.caption(f"Couldn't save the lines snapshot: {feed_status['saved']}")
     else:
-        src_txt.append("no ODDS_API_KEY in Streamlit secrets")
-    st.caption(" · ".join(src_txt) + ". Picks without a DK line show NA.")
-    st.link_button("Open NHL lines on DraftKings ↗", DK_NHL_URL, width="stretch")
-dk_lines = merge_lines(file_lines, api_lines)
+        st.caption(f"Saved pregame lines: {n_auto} from the free feeds, {n_file} from screenshots.")
+    if games:
+        st_html(lines_source_summary(dk_lines))
+    if odds_key:
+        want_props = st.toggle("Also fetch DK player props from The Odds API (uses credits)", value=False, key="odds_props")
+        api_lines, n_api, api_err = load_odds_api(odds_key, date_str, want_props)
+        st.caption(f"The Odds API: {n_api} prices" if not api_err else f"The Odds API error: {api_err}")
+        dk_lines = merge_lines(dk_lines, api_lines)
+    st.caption("Picks without a DK line show NA. Screenshot lines win where both have the same line.")
+    c1, c2 = st.columns(2)
+    if c1.button("↻ Refresh odds", width="stretch", key="feed_refresh"):
+        st.session_state["feed_bust"] = st.session_state.get("feed_bust", 0) + 1
+        st.rerun()
+    c2.link_button("Open NHL on DraftKings ↗", DK_NHL_URL, width="stretch")
 
 tab_bets, tab_slate, tab_props, tab_live, tab_rec = st.tabs(["Bets", "Slate", "Player Props", "Live Tracker", "Record"])
 
@@ -1770,14 +1964,24 @@ def build_bets(scores, bet_overrides, dk):
     return bets, values
 
 
-def best_bets_card(rows):
+SRC_KEY = {"Total": "TOT", "P1 Total": "P1TOT", "P1 ML": "P1ML", "P1 PL": "P1PL", "P1 TNB": "P1TNB"}
+
+
+def line_source(dk, v):
+    """Where a pick's DK price came from (ESPN, DK, screenshot), or ''."""
+    away, _, home = v.get("game", "").replace(" ", "").partition("@")
+    return (dk or {}).get("src", {}).get((away, home, SRC_KEY.get(v["market"], v["market"])), "")
+
+
+def best_bets_card(rows, dk=None):
     trs = ""
     for v in rows:
+        src = line_source(dk, v)
         color = "#86efac" if v["edge"] >= 5 else "#cbd5e1"
         ev = f"{v['ev']:+.0f}" if v["ev"] is not None else "NA"
         trs += (f"<tr><td>{STATUS_ICON[v['status']]} <b>{v['pick']}</b><br>"
                 f"<span class='card-sub'>{v['time']} · proj {v['proj_txt']}</span></td>"
-                f"<td><b>{fmt_odds(v['odds'])}</b></td>"
+                f"<td><b>{fmt_odds(v['odds'])}</b>{f'<br><span class=card-sub>{src}</span>' if src else ''}</td>"
                 f"<td>{v['p']*100:.0f}% <span class='card-sub'>vs {v['imp']*100:.0f}%</span></td>"
                 f"<td><b style='color:{color}'>{v['edge']:+.1f}</b><br><span class='card-sub'>EV {ev}</span></td></tr>")
     return f"""
@@ -1793,7 +1997,8 @@ def best_bets_card(rows):
 def best_bets_section(values):
     st.subheader("🔥 Best bets vs DK")
     if not values:
-        st.info("No DraftKings lines for this date yet. Send DK screenshots (or add ODDS_API_KEY) and the best bets show here.")
+        st.info("No DraftKings lines for this date yet. They load automatically once DK posts them; "
+                "if the 📈 DraftKings lines box above says screenshots are needed, send DK screenshots.")
         return
     c1, c2, c3 = st.columns(3)
     mkts = c1.selectbox("Market", ["All", "Games", "1st period", "SOG", "Points", "Goals"], key="best_mkt")
@@ -1811,7 +2016,7 @@ def best_bets_section(values):
     settled = [v for v in rows if v["status"] in ("hit", "miss")]
     rec = f" · {sum(v['status'] == 'hit' for v in settled)}-{sum(v['status'] == 'miss' for v in settled)} settled" if settled else ""
     st.caption(f"Either side of every DK line, ranked by edge (model % minus DK's no-vig %). EV = expected profit per $100{rec}.")
-    st_html(best_bets_card(rows))
+    st_html(best_bets_card(rows, dk_lines))
     st.caption("1st-period picks are noisier: few goals, so one bounce decides them, and the model's period split "
                "is a league average, not team-specific. "
                "Anytime goal has no DK 'no' price, so its edge is vs DK's price with the vig left in. "
@@ -1821,18 +2026,6 @@ def best_bets_section(values):
 # ----------------------------------------------------------------------------
 # Top pick of the night: pregame snapshot store
 # ----------------------------------------------------------------------------
-def _gh_token():
-    try:
-        return st.secrets.get("GITHUB_TOKEN")
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _gh(method, path, token, **kw):
-    return requests.request(method, f"https://api.github.com/repos/{GH_REPO}/{path}", timeout=15,
-                            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}, **kw)
-
-
 @st.cache_data(ttl=60, show_spinner=False)
 def load_top_picks(token):
     """Saved snapshots: the picks branch on GitHub when a token is set, else a local file (lost on app restart)."""
@@ -1850,13 +2043,6 @@ def load_top_picks(token):
             text = f.read()
     df = pd.read_csv(io.StringIO(text)) if text else pd.DataFrame(columns=PICK_COLS)
     return df.reindex(columns=PICK_COLS), sha
-
-
-def _ensure_branch(token):
-    if _gh("GET", f"branches/{PICKS_BRANCH}", token).status_code == 200:
-        return
-    main_sha = _gh("GET", "git/ref/heads/main", token).json()["object"]["sha"]
-    _gh("POST", "git/refs", token, json={"ref": f"refs/heads/{PICKS_BRANCH}", "sha": main_sha})
 
 
 def save_top_pick(row):
@@ -2111,7 +2297,7 @@ def units_won(odds, result):
 @st.cache_data(ttl=900, show_spinner="Grading best bets against that day's DK lines...")
 def grade_best_bets(season, date_str, today_str):
     """Every DK-priced market on a past slate: the side with the biggest edge vs DK, graded on the final box score."""
-    dk, n = load_file_lines(date_str)
+    dk, n = saved_lines(date_str)
     if not n:
         return pd.DataFrame()
     teams_df, goalies_df, skaters_df = load_moneypuck(season)
@@ -2217,11 +2403,17 @@ def grade_best_bets(season, date_str, today_str):
 
 
 def lines_dates():
+    """Dates with DK lines: screenshot files in the repo plus saved free-feed snapshots."""
     try:
         names = os.listdir(LINES_DIR)
     except OSError:
-        return []
-    return sorted((n[:-4] for n in names if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", n)), reverse=True)
+        names = []
+    dates = {n[:-4] for n in names if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", n)}
+    try:
+        dates |= set(auto_snapshot_dates(_gh_token()))
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(dates, reverse=True)
 
 
 def best_bets_record_section(today):

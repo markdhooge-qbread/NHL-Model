@@ -1,8 +1,15 @@
 # DraftKings lines
 
-The app reads `lines/YYYY-MM-DD.csv` (Eastern date of the slate) and compares each projection to the DraftKings price. Picks with no line here show **NA**.
+Lines now load automatically from two free feeds (no API key, no credits):
 
-If an `ODDS_API_KEY` is set in Streamlit secrets, lines from The Odds API (DraftKings) are loaded too. Those win where both sources have the same line. Manual edits on the Bets tab win over both.
+- **Game lines** (moneyline, total, puck line) from ESPN's public NHL scoreboard, which carries DraftKings prices.
+- **Player props** (SOG, points, anytime goal) from DraftKings' own public sportsbook feed.
+
+Neither is an official API, so either can break or be blocked without warning. The app refetches at most hourly, and only for games that haven't started; once a game starts, its last pregame lines are kept so live odds never replace them. Each day's feed lines are saved to `lines/auto/YYYY-MM-DD.csv` on the `picks-data` branch (needs `GITHUB_TOKEN`), so the Record tab can grade them later.
+
+When a feed fails, the 📈 DraftKings lines box says **screenshots needed**. Then transcribe DK screenshots into `lines/YYYY-MM-DD.csv` (Eastern date of the slate) as before. Screenshot lines win where both have the same line, so they fill or fix feed gaps. Picks with no line anywhere show **NA**.
+
+If an `ODDS_API_KEY` is set in Streamlit secrets, The Odds API is loaded too and wins over both. Manual edits on the Bets tab win over everything.
 
 ## Columns
 

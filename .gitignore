@@ -1,3 +1,6 @@
 __pycache__/
 .streamlit/secrets.toml
 picks/
+__pycache__/
+lines/auto/
+lines/auto/
