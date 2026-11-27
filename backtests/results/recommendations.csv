@@ -1,13 +1,13 @@
 param,live,best_on_tuning,held_out_change,held_out_se,recommendation
-gamma_shape,18.0,1000000.0,-0.015680555345926866,0.002967299644499363,Evidence for 1e+06: better on tuning and on the held-out season by more than 2 SE. Your call.
+gamma_shape,18.0,1000000.0,-0.015680555345926866,0.002967299644499363,Evidence for Poisson: better on tuning and on the held-out season by more than 2 SE. Your call.
 b2b_off,0.94,0.9,-5.238080166907642e-05,0.0003983446687397108,"Weak: 0.9 was a little better on both, but within noise. Keep."
 b2b_def,1.04,1.06,0.00010396795633306556,0.00020876775443672317,Keep: 1.06 won on tuning but not on the held-out season.
 home_ice,0.035,0.05,0.00026190401540201124,0.0005930404818913602,Keep: 0.05 won on tuning but not on the held-out season.
 other_goals,1.0,1.5,-0.011672009001011428,0.0022778266832509503,Evidence for 1.5: better on tuning and on the held-out season by more than 2 SE. Your call.
 ot_xg_weight,0.6,0.9,-6.247451532538485e-05,0.00015595391430426472,"Weak: 0.9 was a little better on both, but within noise. Keep."
 starter_prior,15.0,60.0,-0.0025848048101849027,0.001473527832134909,"Weak: 60 was a little better on both, but within noise. Keep."
-backup_prior,20.0,20.0,0.0,0.0,Keep: nothing beat the live value on the tuning seasons.
-backup_mean,-0.18,-0.18,0.0,0.0,Keep: nothing beat the live value on the tuning seasons.
-backup_drag,-0.1,-0.1,0.0,0.0,Keep: nothing beat the live value on the tuning seasons.
+backup_prior,20.0,40.0,-0.001462982753184872,0.0005459199721280433,Evidence for 40: better on tuning and on the held-out season by more than 2 SE. Your call.
+backup_mean,-0.18,0.0,0.0006474808044812084,0.000739383209131794,Keep: 0 won on tuning but not on the held-out season.
+backup_drag,-0.1,0.0,0.0004320415889558562,0.0006312589030907358,Keep: 0 won on tuning but not on the held-out season.
 p1_share,0.3,0.3,0.0,0.0,Keep: nothing beat the live value on the tuning seasons.
 f10_share,0.48,0.54,-0.0038901487861744645,0.00244229567670717,"Weak: 0.54 was a little better on both, but within noise. Keep."

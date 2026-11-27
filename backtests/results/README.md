@@ -116,7 +116,7 @@ Negative = knowing the real starter helps. This is the cost of locking a pick on
 
 ## 6. Parameters, one at a time
 
-Each row moves one parameter, everything else at the live value. Diff = change in the judged score vs live (negative = better), with its standard error. Rule set before running: suggest a change only if the best tuning value also beats live on the held-out season by more than 2 SE. **No live parameter was changed.**
+Each row moves one parameter, everything else at the live value. Diff = change in the judged score vs live (negative = better), with its standard error. Rule set before running: suggest a change only if the best tuning value also beats live on the held-out season by more than 2 SE. The backup-goalie rows use the goalie who actually started (otherwise no backup ever plays). Moving one parameter at a time can't separate parameters that push the same way. **No live parameter was changed.**
 
 | Parameter | Value | Judged on | Tuning diff | SE | Held-out diff | SE |
 |---|---|---|---|---|---|---|
@@ -150,15 +150,15 @@ Each row moves one parameter, everything else at the live value. Diff = change i
 | starter_prior | 15 (live) | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
 | starter_prior | 30 | win log loss | -0.0014 | 0.0005 | -0.0018 | 0.0008 |
 | starter_prior | 60 | win log loss | -0.0020 | 0.0008 | -0.0026 | 0.0015 |
-| backup_prior | 10 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| backup_prior | 10 | win log loss | 0.0011 | 0.0004 | 0.0019 | 0.0007 |
 | backup_prior | 20 (live) | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
-| backup_prior | 40 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
-| backup_mean | 0 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| backup_prior | 40 | win log loss | -0.0007 | 0.0003 | -0.0015 | 0.0005 |
+| backup_mean | 0 | win log loss | -0.0002 | 0.0004 | 0.0006 | 0.0007 |
 | backup_mean | -0.18 (live) | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
-| backup_mean | -0.3 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
-| backup_drag | 0 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| backup_mean | -0.3 | win log loss | 0.0007 | 0.0003 | -0.0001 | 0.0005 |
+| backup_drag | 0 | win log loss | -0.0002 | 0.0004 | 0.0004 | 0.0006 |
 | backup_drag | -0.1 (live) | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
-| backup_drag | -0.2 | win log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| backup_drag | -0.2 | win log loss | 0.0007 | 0.0004 | -0.0001 | 0.0006 |
 | p1_share | 0.27 | 1st-period goals log loss | 0.0140 | 0.0021 | 0.0176 | 0.0036 |
 | p1_share | 0.3 (live) | 1st-period goals log loss | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
 | p1_share | 0.33 | 1st-period goals log loss | 0.0010 | 0.0019 | -0.0021 | 0.0033 |
@@ -170,16 +170,16 @@ Each row moves one parameter, everything else at the live value. Diff = change i
 
 | Parameter | Live | Best on tuning | Recommendation |
 |---|---|---|---|
-| gamma_shape | 18 | Poisson | Evidence for 1e+06: better on tuning and on the held-out season by more than 2 SE. Your call. |
+| gamma_shape | 18 | Poisson | Evidence for Poisson: better on tuning and on the held-out season by more than 2 SE. Your call. |
 | b2b_off | 0.94 | 0.9 | Weak: 0.9 was a little better on both, but within noise. Keep. |
 | b2b_def | 1.04 | 1.06 | Keep: 1.06 won on tuning but not on the held-out season. |
 | home_ice | 0.035 | 0.05 | Keep: 0.05 won on tuning but not on the held-out season. |
 | other_goals | 1 | 1.5 | Evidence for 1.5: better on tuning and on the held-out season by more than 2 SE. Your call. |
 | ot_xg_weight | 0.6 | 0.9 | Weak: 0.9 was a little better on both, but within noise. Keep. |
 | starter_prior | 15 | 60 | Weak: 60 was a little better on both, but within noise. Keep. |
-| backup_prior | 20 | 20 | Keep: nothing beat the live value on the tuning seasons. |
-| backup_mean | -0.18 | -0.18 | Keep: nothing beat the live value on the tuning seasons. |
-| backup_drag | -0.1 | -0.1 | Keep: nothing beat the live value on the tuning seasons. |
+| backup_prior | 20 | 40 | Evidence for 40: better on tuning and on the held-out season by more than 2 SE. Your call. |
+| backup_mean | -0.18 | 0 | Keep: 0 won on tuning but not on the held-out season. |
+| backup_drag | -0.1 | 0 | Keep: 0 won on tuning but not on the held-out season. |
 | p1_share | 0.3 | 0.3 | Keep: nothing beat the live value on the tuning seasons. |
 | f10_share | 0.48 | 0.54 | Weak: 0.54 was a little better on both, but within noise. Keep. |
 
