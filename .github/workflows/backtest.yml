@@ -1,0 +1,64 @@
+name: Backtest
+# Runs the backtest on GitHub's servers (they can reach MoneyPuck and the NHL API).
+# Start it from the Actions tab: Backtest > Run workflow. Results land in backtests/results/.
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "Extra arguments, e.g. --quick or --n-sims 4000"
+        required: false
+        default: ""
+  push:
+    branches: ["claude/**"]
+    paths: ["backtests/**.py", "model_core.py", ".github/workflows/backtest.yml"]
+env:
+  PUSH_ARGS: ""   # set to "--quick" for a fast check on pushes to claude/ branches
+permissions:
+  contents: write
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install numpy pandas requests pytest
+      - name: Tests
+        run: python -m pytest -q tests
+      - name: Saved free-feed lines from the picks-data branch (for the market check)
+        run: |
+          git fetch --depth 1 origin picks-data && git checkout FETCH_HEAD -- lines/auto && git reset -q -- lines/auto || true
+          ls lines lines/auto 2>/dev/null || true
+      - uses: actions/cache/restore@v4
+        with:
+          path: backtests/.cache
+          key: backtest-data-${{ github.run_id }}
+          restore-keys: backtest-data-
+      - name: Check the NHL score feed shape
+        run: |
+          curl -s https://api-web.nhle.com/v1/score/2025-01-15 | python -c "import json,sys; g=json.load(sys.stdin)['games'][0]; print(sorted(g)); print(g.get('goals',[None])[:1])"
+      - name: Run backtest
+        run: python -m backtests.run_backtest ${{ github.event_name == 'push' && env.PUSH_ARGS || github.event.inputs.args }}
+      - name: Save downloaded data for the next run (even if the run failed)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: backtests/.cache
+          key: backtest-data-${{ github.run_id }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtests/results
+      - name: Commit results (not on main)
+        if: github.ref != 'refs/heads/main'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add backtests/results
+          git diff --cached --quiet || (git commit -m "Backtest results" && git pull --rebase origin "${GITHUB_REF_NAME}" && git push)

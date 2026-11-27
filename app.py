@@ -16,12 +16,16 @@ import re
 import unicodedata
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
+import clv
 import odds_feeds
+from model_core import (  # model math lives in model_core.py so the backtest runs the same code
+    B2B_DEF, B2B_OFF, GAMMA_SHAPE, N_SIMS, Model, american_to_prob, implied_3way, implied_no_vig, line_probs,
+    pmf_over_under, prob_to_american,
+)
 
 # ----------------------------------------------------------------------------
 # Config
@@ -29,15 +33,8 @@ import odds_feeds
 SEASON = 2026
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 EST = ZoneInfo("America/New_York")
-N_SIMS = 10_000
-GAMMA_SHAPE = 18.0
-P1_SHARE = 0.30   # share of regulation goals scored in the 1st period (league ~30/35/35)
-F10_SHARE = 0.48  # share of 1st-period goals scored in its first 10 minutes
-B2B_OFF = 0.94   # 6% offensive drag for a team on a back-to-back
-B2B_DEF = 1.04   # 4% defensive fatigue penalty (opponent of a B2B team gains)
 MP_BASE = "https://moneypuck.com/moneypuck/playerData/seasonSummary"
 NHL_API = "https://api-web.nhle.com/v1"
-MP_MAP = {"LAK": "L.A", "NJD": "N.J", "SJS": "S.J", "TBL": "T.B"}
 SEASON_START = datetime.date(SEASON, 10, 1)
 DK_NHL_URL = "https://sportsbook.draftkings.com/leagues/hockey/nhl"
 LINES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lines")
@@ -49,6 +46,9 @@ PICKS_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "picks", 
 AUTO_LINES_DIR = "lines/auto"     # free-feed pregame snapshots, also on the picks branch
 AUTO_LINES_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lines", "auto")
 FEED_TTL = 3600                  # refetch the free feeds at most hourly, and only for games not started
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CANDS_DIR = "picks/candidates"       # pick-time snapshot of every Best bets candidate, per day (picks branch)
+CLV_PATH = "picks/clv_log.csv"       # append-only closing line value log (picks branch)
 PICK_COLS = ["date", "pick", "market", "game", "odds", "p", "imp", "edge", "saved_at"]
 TOP_MIN_EDGE, TOP_MIN_P = 3.0, 0.35  # same defaults as the Best bets board
 TEAM_ABBR = {
@@ -185,38 +185,6 @@ def starter_goalie_id(box, side):
     return None
 
 
-def poisson_cdf(k, lam):
-    """P(X <= k) for X ~ Poisson(lam)."""
-    if k < 0:
-        return 0.0
-    term = total = math.exp(-lam)
-    for i in range(1, int(k) + 1):
-        term *= lam / i
-        total += term
-    return min(total, 1.0)
-
-
-def line_probs(lam, line):
-    """Over / under / push probabilities for a Poisson mean against a prop line."""
-    if float(line).is_integer():
-        k = int(line)
-        under = poisson_cdf(k - 1, lam)
-        push = poisson_cdf(k, lam) - under
-        return 1.0 - under - push, under, push
-    under = poisson_cdf(math.floor(line), lam)
-    return 1.0 - under, under, 0.0
-
-
-def american_to_prob(odds):
-    if odds is None or odds == 0 or -100 < odds < 100:
-        return None
-    return (-odds) / (-odds + 100.0) if odds < 0 else 100.0 / (odds + 100.0)
-
-
-def prob_to_american(p):
-    if p <= 0 or p >= 1:
-        return "—"
-    return f"{-100.0 * p / (1 - p):+.0f}" if p >= 0.5 else f"+{100.0 * (1 - p) / p:.0f}"
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading season results...")
@@ -302,168 +270,6 @@ def teams_played_on(sched, date_str):
         for g in d.get("games", [])
         for k in ("awayTeam", "homeTeam")
     }
-
-
-# ----------------------------------------------------------------------------
-# Model
-# ----------------------------------------------------------------------------
-class Model:
-    def __init__(self, teams_df, goalies_df, skaters_df, b2b_teams):
-        self.teams_df = teams_df
-        self.goalies_df = goalies_df
-        self.skaters_df = skaters_df
-        self.b2b = b2b_teams
-        lg_5v5 = teams_df[teams_df["situation"] == "5on5"]
-        lg_hrs = lg_5v5["iceTime"].sum() / 3600.0
-        self.LG_XG5 = lg_5v5["xGoalsFor"].sum() / lg_hrs
-        self.LG_CA60 = lg_5v5["shotAttemptsAgainst"].sum() / lg_hrs
-        lg_pp = teams_df[teams_df["situation"] == "5on4"]
-        self.LG_XGPP = lg_pp["xGoalsFor"].sum() / (lg_pp["iceTime"].sum() / 3600.0)
-
-    def to_mp(self, abbr):
-        return abbr if abbr in self.teams_df["team"].values else MP_MAP.get(abbr, abbr)
-
-    # -- Teams --------------------------------------------------------------
-    def get_team(self, abbr):
-        t = self.teams_df[self.teams_df["team"] == self.to_mp(abbr)]
-        if t.empty:
-            raise ValueError(f"No MoneyPuck team data for {abbr}")
-        s5, spp, spk, sall = [t[t["situation"] == s].iloc[0] for s in ("5on5", "5on4", "4on5", "all")]
-        toi5, toipp, toipk, toiall = [max(x["iceTime"] / 3600.0, 0.05) for x in (s5, spp, spk, sall)]
-        xgf_c = "scoreVenueAdjustedxGoalsFor" if "scoreVenueAdjustedxGoalsFor" in s5.index else "xGoalsFor"
-        xga_c = "scoreVenueAdjustedxGoalsAgainst" if "scoreVenueAdjustedxGoalsAgainst" in s5.index else "xGoalsAgainst"
-        hdcf, hdca = s5["highDangerShotsFor"] / toi5, s5["highDangerShotsAgainst"] / toi5
-        return {
-            "xgf60": s5[xgf_c] / toi5, "xga60": s5[xga_c] / toi5,
-            "cf60": s5["shotAttemptsFor"] / toi5, "ca60": s5["shotAttemptsAgainst"] / toi5,
-            "hdcf_pct": (hdcf / max(hdcf + hdca, 0.1)) * 100,
-            "pp_xgf60": spp["xGoalsFor"] / toipp, "pk_xga60": spk["xGoalsAgainst"] / toipk,
-            "drawn60": sall["penaltiesAgainst"] / toiall, "taken60": sall["penaltiesFor"] / toiall,
-        }
-
-    # -- Goalies ------------------------------------------------------------
-    def team_goalies(self, abbr):
-        g = self.goalies_df
-        return g[(g["situation"] == "all") & (g["team"] == self.to_mp(abbr))].sort_values("games_played", ascending=False)
-
-    def get_goalie(self, abbr, goalie_name=None, goalie_id=None):
-        """#1 starter (most GP) regresses to 0.00 GSAx/60 over 15 games;
-        backups regress to -0.18 over 20 games, then a -0.10 drag.
-        goalie_name (manual override) wins over goalie_id (NHL-confirmed starter)."""
-        team_g = self.team_goalies(abbr)
-        if team_g.empty:
-            return {"name": "Unknown", "label": "Unknown", "adj60": 0.0, "is_backup": False, "source": "projected"}
-        starter = team_g.iloc[0]["name"]
-        source = "projected"
-        target = starter
-        if goalie_name in team_g["name"].values:
-            target, source = goalie_name, "override"
-        elif goalie_id is not None and "playerId" in team_g.columns and goalie_id in team_g["playerId"].values:
-            target, source = team_g[team_g["playerId"] == goalie_id].iloc[0]["name"], "confirmed"
-        g = team_g[team_g["name"] == target].iloc[0]
-        gp = int(g["games_played"])
-        toi = max(g["icetime"] / 3600.0, 0.1)
-        raw60 = (g["xGoals"] - g["goals"]) / toi
-        is_backup = target != starter
-        if is_backup:
-            adj60 = ((raw60 * toi) + (-0.18 * 20.0)) / (toi + 20.0) - 0.10
-        else:
-            adj60 = (raw60 * toi) / (toi + 15.0)
-        return {"name": target, "label": f"{target} ({gp} GP)", "adj60": adj60, "is_backup": is_backup, "source": source}
-
-    # -- Game simulation ----------------------------------------------------
-    def simulate_game(self, aa, ha, ag, hg, seed=42):
-        a, h = self.get_team(aa), self.get_team(ha)
-        a_b2b, h_b2b = aa in self.b2b, ha in self.b2b
-
-        app_m = float(np.clip(5.2 + (a["drawn60"] - 3.3) * 0.65 + (h["taken60"] - 3.3) * 0.65, 2.5, 9.5))
-        hpp_m = float(np.clip(5.2 + (h["drawn60"] - 3.3) * 0.65 + (a["taken60"] - 3.3) * 0.65, 2.5, 9.5))
-        ev_m = max(60.0 - app_m - hpp_m, 42.0)
-
-        a5_rate = a["xgf60"] * (h["xga60"] / self.LG_XG5) * 0.965 * (B2B_OFF if a_b2b else 1.0) * (B2B_DEF if h_b2b else 1.0)
-        h5_rate = h["xgf60"] * (a["xga60"] / self.LG_XG5) * 1.035 * (B2B_OFF if h_b2b else 1.0) * (B2B_DEF if a_b2b else 1.0)
-        a_5v5, h_5v5 = a5_rate * (ev_m / 60.0), h5_rate * (ev_m / 60.0)
-        a_pp = a["pp_xgf60"] * (h["pk_xga60"] / self.LG_XGPP) * (app_m / 60.0)
-        h_pp = h["pp_xgf60"] * (a["pk_xga60"] / self.LG_XGPP) * (hpp_m / 60.0)
-
-        alam = max(a_5v5 + a_pp - hg["adj60"] + 0.16, 0.8)
-        hlam = max(h_5v5 + h_pp - ag["adj60"] + 0.18, 0.8)
-
-        rng = np.random.default_rng(seed)
-        ar = rng.poisson(rng.gamma(GAMMA_SHAPE, alam / GAMMA_SHAPE, N_SIMS))
-        hr = rng.poisson(rng.gamma(GAMMA_SHAPE, hlam / GAMMA_SHAPE, N_SIMS))
-        ties = ar == hr
-        af, hf = ar.copy(), hr.copy()
-        if ties.sum() > 0:
-            away_ot = rng.random(ties.sum()) < (0.60 * (a5_rate / (a5_rate + h5_rate)) + 0.20)
-            idx = np.where(ties)[0]
-            af[idx[away_ot]] += 1
-            hf[idx[~away_ot]] += 1
-        tot = af + hf
-        # 1st period: thin each team's regulation goals to the 1st period, then to its first 10 minutes.
-        a1, h1 = rng.binomial(ar, P1_SHARE), rng.binomial(hr, P1_SHARE)
-        t1 = a1 + h1
-        f10 = rng.binomial(t1, F10_SHARE)
-
-        return {
-            "a": a, "h": h, "a_b2b": a_b2b, "h_b2b": h_b2b,
-            "app_m": app_m, "hpp_m": hpp_m, "ev_m": ev_m,
-            "a_5v5": a_5v5, "h_5v5": h_5v5, "a_pp": a_pp, "h_pp": h_pp,
-            "proj_a": af.mean(), "proj_h": hf.mean(), "proj_tot": tot.mean(),
-            "a_win": (af > hf).mean(), "h_win": (hf > af).mean(),
-            "o55": (tot > 5.5).mean(),
-            "tot_pmf": np.bincount(tot) / len(tot),
-            "p1_a": a1.mean(), "p1_h": h1.mean(), "p1_tot": t1.mean(),
-            "p1_pmf": np.bincount(t1, minlength=3) / len(t1),
-            "p1_a_win": (a1 > h1).mean(), "p1_h_win": (h1 > a1).mean(), "p1_tie": (a1 == h1).mean(),
-            "f10": (f10 > 0).mean(),
-        }
-
-    # -- Player props -------------------------------------------------------
-    def project_skaters(self, team_abbr, opp_abbr, is_home, opp_gsax60, apply_b2b=True, player_ids=None):
-        opp = self.get_team(opp_abbr)
-        is_b2b = apply_b2b and team_abbr in self.b2b
-        opp_b2b = apply_b2b and opp_abbr in self.b2b
-        venue = 1.035 if is_home else 0.965
-
-        pace_mult = (opp["ca60"] / self.LG_CA60) * venue * (0.95 if is_b2b else 1.0)
-        xg_mult = (opp["xga60"] / self.LG_XG5) * venue * (B2B_OFF if is_b2b else 1.0) * (B2B_DEF if opp_b2b else 1.0)
-        pp_mult = opp["pk_xga60"] / self.LG_XGPP
-        goalie_mult = max(1.0 - (opp_gsax60 / 3.0), 0.75)
-
-        sk = self.skaters_df
-        pool = sk[(sk["team"] == self.to_mp(team_abbr)) & (sk["games_played"] >= 1)]
-        if player_ids:
-            in_lineup = pool[pool["playerId"].isin(player_ids)]
-            if not in_lineup.empty:
-                pool = in_lineup
-        s_all = pool[pool["situation"] == "all"]
-        s_5v5 = pool[pool["situation"] == "5on5"].set_index("playerId")
-        s_pp = pool[pool["situation"] == "5on4"].set_index("playerId")
-
-        rows = []
-        for _, p in s_all.iterrows():
-            pid, gp = p["playerId"], max(int(p["games_played"]), 1)
-            toi_pg = (p["icetime"] / 60.0) / gp
-            p5 = s_5v5.loc[pid] if pid in s_5v5.index else None
-            ppp = s_pp.loc[pid] if pid in s_pp.index else None
-            ev_pg = ((p5["icetime"] / 60.0) / gp) if p5 is not None else toi_pg * 0.85
-            pp_pg = ((ppp["icetime"] / 60.0) / gp) if ppp is not None else 0.0
-            all_hrs = max(p["icetime"] / 3600.0, 0.1)
-
-            sog = (p["I_F_shotsOnGoal"] / all_hrs) * (toi_pg / 60.0) * pace_mult
-            ixg_5v5 = (p5["I_F_xGoals"] / max(p5["icetime"] / 3600.0, 0.1)) if p5 is not None else 0.0
-            ixg_pp = (ppp["I_F_xGoals"] / max(ppp["icetime"] / 3600.0, 0.05)) if (ppp is not None and ppp["icetime"] > 60) else 0.0
-            xg = ((ixg_5v5 * (ev_pg / 60.0) * xg_mult) + (ixg_pp * (pp_pg / 60.0) * pp_mult)) * goalie_mult
-            ast = ((p["I_F_primaryAssists"] + p["I_F_secondaryAssists"]) / all_hrs) * (toi_pg / 60.0) * xg_mult
-            pts = xg + ast
-            rows.append({
-                "playerId": pid, "name": p["name"], "pos": p["position"], "gp": gp,
-                "toi": toi_pg, "pp": pp_pg, "sog": sog, "xg": xg,
-                "atg": (1 - np.exp(-xg)) * 100, "pts": pts, "pt_p": (1 - np.exp(-pts)) * 100,
-            })
-        cols = ["playerId", "name", "pos", "gp", "toi", "pp", "sog", "xg", "atg", "pts", "pt_p"]
-        return pd.DataFrame(rows, columns=cols).sort_values("pts", ascending=False)
 
 
 # ----------------------------------------------------------------------------
@@ -1172,23 +978,6 @@ def side_price(dk_rec, line, side):
     return mine, other
 
 
-def implied_no_vig(mine, other):
-    """Implied % for my side; removes the vig when both sides are known."""
-    p_m = american_to_prob(mine) if mine is not None else None
-    if p_m is None:
-        return None
-    p_o = american_to_prob(other) if other is not None else None
-    return p_m / (p_m + p_o) if p_o else p_m
-
-
-def implied_3way(prices, key):
-    """Implied % for one outcome of a 3-way market; vig removed when all three prices are known."""
-    probs = {k: american_to_prob(v) for k, v in (prices or {}).items() if v is not None}
-    probs = {k: v for k, v in probs.items() if v}
-    if key not in probs:
-        return None
-    return probs[key] / sum(probs.values()) if len(probs) >= 3 else probs[key]
-
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_landing(game_id):
@@ -1332,13 +1121,6 @@ STATUS_TEXT = {"pregame": "Pregame", "on": "On pace", "off": "Off pace", "tied":
                "hit": "Hit", "miss": "Miss", "push": "Push", "na": "No period data yet"}
 
 
-def pmf_over_under(pmf, line):
-    """Over / under / push probabilities from a goals PMF."""
-    ks = np.arange(len(pmf))
-    over = float(pmf[ks > line].sum())
-    push = float(pmf[ks == line].sum()) if float(line).is_integer() else 0.0
-    return over, max(1.0 - over - push, 0.0), push
-
 
 def default_total_line(proj_tot):
     return 6.5 if proj_tot >= 6.0 else 5.5
@@ -1427,7 +1209,7 @@ def value_side(cands):
             continue
         edge = (p - imp) * 100
         if best is None or edge > best["edge"]:
-            best = {"pick": label, "side": side, "p": p, "odds": odds, "imp": imp, "edge": edge,
+            best = {"pick": label, "side": side, "p": p, "odds": odds, "other": other, "imp": imp, "edge": edge,
                     "ev": ev_per_100(p, odds)}
     return best
 
@@ -1788,7 +1570,7 @@ def build_bets(scores, bet_overrides, dk):
         if v:
             v["pick"] = f"{v['pick']} ({game_lbl})"
             add_value(v, {"kind": "Game", "market": "ML", "game": game_lbl, "time": g["time"],
-                          "status": ml_status(v["side"]), "now": now,
+                          "status": ml_status(v["side"]), "now": now, "ref": clv.make_ref("ML", game_lbl, v["side"]),
                           "proj_txt": f"{aa} {sim['proj_a']:.2f} – {sim['proj_h']:.2f} {ha}"})
         bets.append({"id": bid, "kind": "Game", "market": "ML", "pick": f"{pick_team} ML ({game_lbl})",
                      "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "src": src,
@@ -1813,7 +1595,8 @@ def build_bets(scores, bet_overrides, dk):
             if v:
                 vs, _ = grade_count(v["side"], tl, a_now + h_now, final, frac)
                 add_value(v, {"kind": "Game", "market": "Total", "game": game_lbl, "time": g["time"],
-                              "status": vs, "now": now, "proj_txt": f"{sim['proj_tot']:.2f} goals"})
+                              "status": vs, "now": now, "proj_txt": f"{sim['proj_tot']:.2f} goals",
+                              "ref": clv.make_ref("Total", game_lbl, v["side"], tl)})
         bets.append({"id": bid, "kind": "Game", "market": "Total", "pick": f"{game_lbl} {side[0]} {line:g}",
                      "game": game_lbl, "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge, "src": src,
                      "line": line, "line_txt": f"{side} {line:g}", "proj_txt": f"{sim['proj_tot']:.2f} goals",
@@ -1852,7 +1635,8 @@ def build_bets(scores, bet_overrides, dk):
             if v:
                 vs = grade_count(v["side"], tl, a1 + h1, p1_done, f1)[0] if (p1 or f1 is None) else "na"
                 add_value(v, {**base, "market": "P1 Total", "status": vs,
-                              "proj_txt": f"{sim['p1_tot']:.2f} 1st-period goals"})
+                              "proj_txt": f"{sim['p1_tot']:.2f} 1st-period goals",
+                              "ref": clv.make_ref("P1 Total", game_lbl, v["side"], tl)})
 
         bid = f"{gid}-P1ML"
         ov = bet_overrides.get(bid, {})
@@ -1872,7 +1656,8 @@ def build_bets(scores, bet_overrides, dk):
         v = value_side([(p1_lbl(k), k, pk, dk_p1m.get(k), None, implied_3way(dk_p1m, k)) for k, pk in outcomes])
         if v:
             vs = p1_ml_status(v["side"], aa, a1, h1, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
-            add_value(v, {**base, "market": "P1 ML", "status": vs, "proj_txt": p1_proj})
+            add_value(v, {**base, "market": "P1 ML", "status": vs, "proj_txt": p1_proj,
+                          "ref": clv.make_ref("P1 ML", game_lbl, v["side"])})
 
         bid = f"{gid}-F10"
         ov = bet_overrides.get(bid, {})
@@ -1891,14 +1676,16 @@ def build_bets(scores, bet_overrides, dk):
                             (f10_lbl("Under"), "Under", 1 - sim["f10"], dk_f10.get("under"), dk_f10.get("over"))])
             if v:
                 vs = f10_status(v["side"], first, p1_mins, p1_done) if f1 is not None and p1 else ("pregame" if f1 is None else "na")
-                add_value(v, {**base, "market": "F10", "status": vs, "proj_txt": f10_proj})
+                add_value(v, {**base, "market": "F10", "status": vs, "proj_txt": f10_proj,
+                              "ref": clv.make_ref("F10", game_lbl, v["side"], 0.5)})
 
         for mkt, cands in p1_extra_cands(aa, ha, sim, dk, game_lbl).items():
             v = value_side(cands)
             if v:
                 vs = (p1_extra_status(mkt, v["side"], aa, a1, h1, p1_done) if f1 is not None and p1
                       else ("pregame" if f1 is None else "na"))
-                add_value(v, {**base, "market": mkt, "status": vs, "proj_txt": p1_proj})
+                add_value(v, {**base, "market": mkt, "status": vs, "proj_txt": p1_proj,
+                              "ref": clv.make_ref(mkt, game_lbl, v["side"])})
                 bets.append({**base, "id": f"{gid}-{mkt}", "market": mkt, "pick": v["pick"], "p": v["p"],
                              "odds": v["odds"], "imp": v["imp"], "edge": v["edge"], "src": "DK", "line": None,
                              "line_txt": "1st period puck line" if mkt == "P1 PL" else "1st period tie no bet",
@@ -1956,7 +1743,8 @@ def build_bets(scores, bet_overrides, dk):
                         if v:
                             vs, _ = grade_count(v["side"], dl, cur, final, frac if in_lineup else None)
                             add_value(v, {"kind": "Player", "market": mkt, "game": game_lbl, "time": g["time"],
-                                          "status": vs, "now": now, "proj_txt": f"{float(r[key]):.2f} {mkt}"})
+                                          "status": vs, "now": now, "proj_txt": f"{float(r[key]):.2f} {mkt}",
+                                          "ref": clv.make_ref(mkt, game_lbl, v["side"], dl, r["name"])})
                     bets.append({"id": bid, "kind": "Player", "market": mkt, "pick": pick, "game": game_lbl,
                                  "time": g["time"], "p": p, "odds": odds, "imp": imp, "edge": edge,
                                  "src": src, "line": line, "line_txt": line_txt,
@@ -2074,6 +1862,118 @@ def save_top_pick(row):
     return err
 
 
+def _load_branch_csv(path, token, cols):
+    """(DataFrame, sha) for a CSV on the picks branch, else the local copy, else empty."""
+    text, sha = None, None
+    if token:
+        try:
+            r = _gh("GET", f"contents/{path}", token, params={"ref": PICKS_BRANCH})
+            if r.status_code == 200:
+                j = r.json()
+                text, sha = base64.b64decode(j["content"]).decode(), j["sha"]
+        except Exception:  # noqa: BLE001
+            pass
+    local = os.path.join(APP_DIR, path)
+    if text is None and os.path.exists(local):
+        with open(local) as f:
+            text = f.read()
+    df = pd.read_csv(io.StringIO(text), dtype=str).fillna("") if text else pd.DataFrame(columns=cols)
+    return df.reindex(columns=cols).fillna(""), sha
+
+
+def _save_branch_csv(path, df, cols, message, sha=None):
+    """Write a CSV to the picks branch (local disk without a token). Returns None on success, else an error."""
+    text = df.reindex(columns=cols).to_csv(index=False)
+    token, err = _gh_token(), None
+    if token:
+        try:
+            _ensure_branch(token)
+            body = {"message": message, "branch": PICKS_BRANCH, "content": base64.b64encode(text.encode()).decode()}
+            if sha:
+                body["sha"] = sha
+            r = _gh("PUT", f"contents/{path}", token, json=body)
+            if r.status_code not in (200, 201):
+                err = f"GitHub save failed ({r.status_code})"
+        except Exception as exc:  # noqa: BLE001
+            err = f"GitHub save failed ({exc})"
+    else:
+        err = "no GITHUB_TOKEN"
+    if err:
+        local = os.path.join(APP_DIR, path)
+        os.makedirs(os.path.dirname(local), exist_ok=True)
+        with open(local, "w") as f:
+            f.write(text)
+    return err
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_candidates(token, date_str):
+    return _load_branch_csv(f"{CANDS_DIR}/{date_str}.csv", token, clv.CAND_COLS)
+
+
+def save_candidates(date_str, values, top, saved_at):
+    """Pick-time snapshot of tonight's Best bets candidates. Only called before the first puck drop."""
+    _, sha = load_candidates(_gh_token(), date_str)
+    df = clv.candidates_snapshot(values, top, date_str, saved_at, TOP_MIN_EDGE, TOP_MIN_P)
+    err = _save_branch_csv(f"{CANDS_DIR}/{date_str}.csv", df, clv.CAND_COLS, f"Best bets candidates {date_str}", sha)
+    load_candidates.clear()
+    return err
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_clv_log(token):
+    return _load_branch_csv(CLV_PATH, token, clv.LOG_COLS)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def candidate_dates(token):
+    """Dates with a candidates snapshot on the picks branch (or on local disk)."""
+    names = []
+    if token:
+        try:
+            r = _gh("GET", f"contents/{CANDS_DIR}", token, params={"ref": PICKS_BRANCH})
+            if r.status_code == 200:
+                names = [f["name"] for f in r.json() if isinstance(f, dict)]
+        except Exception:  # noqa: BLE001
+            pass
+    local = os.path.join(APP_DIR, CANDS_DIR)
+    if os.path.isdir(local):
+        names += os.listdir(local)
+    return sorted({n[:-4] for n in names if re.fullmatch(r"\d{4}-\d{2}-\d{2}\.csv", n)})
+
+
+def update_clv_log(today):
+    """Append CLV rows for finished dates not yet in the log. The last pregame price is that day's saved
+    free-feed snapshot, which stops updating for a game once it starts. Returns (rows added, error)."""
+    token = _gh_token()
+    log, sha = load_clv_log(token)
+    have = set(log["date"].astype(str))
+    picks, _ = load_top_picks(token)
+    dates = set(candidate_dates(token)) | set(picks["date"].astype(str))
+    todo = sorted(d for d in dates if d < today.isoformat() and d not in have)
+    if not todo:
+        return 0, None
+    new = []
+    for d in todo:
+        cands, _ = load_candidates(token, d)
+        top = picks[picks["date"].astype(str) == d]
+        if len(top) and not (cands["is_top"].astype(str) == "1").any():
+            cands = pd.concat([pd.DataFrame([clv.top_pick_as_candidate(top.iloc[0])]), cands], ignore_index=True)
+        if cands.empty:
+            continue
+        snap, _ = load_auto_snapshot(token, d)
+        dk_close = lines_from_df(snap, "feed")[0] if len(snap) else None
+        new.append(clv.with_close(cands, dk_close, datetime.datetime.now(EST).strftime("%Y-%m-%d %H:%M ET")))
+    if not new:
+        return 0, None
+    log2, added = clv.append_log(log, pd.concat(new, ignore_index=True))
+    if not added:
+        return 0, None
+    err = _save_branch_csv(CLV_PATH, log2, clv.LOG_COLS, f"CLV log through {todo[-1]}", sha)
+    load_clv_log.clear()
+    return added, err
+
+
 def top_value_pick(values):
     rows = [v for v in values if v["edge"] >= TOP_MIN_EDGE and v["p"] >= TOP_MIN_P]
     return max(rows, key=lambda v: v["edge"]) if rows else None
@@ -2091,15 +1991,19 @@ def maybe_snapshot_top_pick(values, games, date_str, now):
     key = (date_str, v["pick"], v["odds"])
     if st.session_state.get("top_pick_saved") == key:
         return None
+    saved_at = now.strftime("%H:%M ET")
     saved, _ = load_top_picks(_gh_token())
     same = saved[(saved["date"] == date_str) & (saved["pick"] == v["pick"])]
     if len(same) and int(same.iloc[0]["odds"]) == int(v["odds"]):
         st.session_state["top_pick_saved"] = key
+        if load_candidates(_gh_token(), date_str)[0].empty:  # first run of the CLV log on an already-saved night
+            save_candidates(date_str, values, v, str(same.iloc[0]["saved_at"]) or saved_at)
         return None
     st.session_state["top_pick_saved"] = key
+    save_candidates(date_str, values, v, saved_at)
     return save_top_pick({"date": date_str, "pick": v["pick"], "market": v["market"], "game": v["game"],
                           "odds": int(v["odds"]), "p": round(v["p"], 4), "imp": round(v["imp"], 4),
-                          "edge": round(v["edge"], 2), "saved_at": now.strftime("%H:%M ET")})
+                          "edge": round(v["edge"], 2), "saved_at": saved_at})
 
 
 with tab_bets:
@@ -2530,8 +2434,117 @@ def top_pick_record_section(today):
     st.divider()
 
 
+def final_for(date_str, away, home, need_p1=False):
+    """Final score, 1st period and skater stats for one game, for grading logged picks; None if not final."""
+    try:
+        g = next((x for x in games_on(load_schedule(date_str), date_str) if x["away"] == away and x["home"] == home), None)
+        if g is None:
+            return None
+        box = load_final_boxscore(g["id"])
+    except Exception:  # noqa: BLE001
+        return None
+    if box.get("gameState") not in FINAL_STATES:
+        return None
+    players = {}
+    for side in ("awayTeam", "homeTeam"):
+        for grp in ("forwards", "defense"):
+            for p in box.get("playerByGameStats", {}).get(side, {}).get(grp, []):
+                nm = (p.get("name") or {}).get("default") if isinstance(p.get("name"), dict) else p.get("name")
+                players[clv.short_key(nm or "")] = {"g": p.get("goals", 0), "pts": p.get("points", 0), "sog": p.get("sog", 0)}
+    p1 = None
+    if need_p1:
+        try:
+            p1 = p1_result(load_landing(g["id"]), away, home)
+        except Exception:  # noqa: BLE001
+            p1 = None
+    return {"a": box.get("awayTeam", {}).get("score") or 0, "h": box.get("homeTeam", {}).get("score") or 0,
+            "p1": p1, "players": players}
+
+
+@st.cache_data(ttl=1800, show_spinner="Grading logged picks...")
+def grade_log_rows(rows_key):
+    """{(date, pick): result} for logged picks. rows_key: tuple of (date, pick, ref fields...)."""
+    out = {}
+    for date_str, pick, ref_mkt, away, home, side, line, player in rows_key:
+        ref = {"ref_mkt": ref_mkt, "away": away, "home": home, "side": side, "line": line, "player": player}
+        fin = final_for(date_str, away, home, need_p1=ref_mkt.startswith("P1") or ref_mkt == "F10")
+        out[(date_str, pick)] = clv.grade(ref, fin)
+    return out
+
+
+def _clv_cell(x, suffix=""):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "NA"
+    color = "#86efac" if v > 0 else ("#fca5a5" if v < 0 else "#cbd5e1")
+    return f"<b style='color:{color}'>{v:+.1f}{suffix}</b>"
+
+
+def clv_record_section(today):
+    st_html("<div class='section'>📉 Closing line value (CLV)</div>")
+    added, err = update_clv_log(today)
+    if err and err != "no GITHUB_TOKEN":
+        st.caption(f"Couldn't save the CLV log: {err}")
+    log, _ = load_clv_log(_gh_token())
+    if log.empty:
+        st.info("Nothing logged yet. Each night's top pick and Best bets candidates are saved with their price "
+                "before the first puck drop, then compared with DraftKings' last pregame price the next day.")
+        return
+    key = tuple((str(r["date"]), str(r["pick"]), str(r["ref_mkt"]), str(r["away"]), str(r["home"]), str(r["side"]),
+                 str(r["line"]), str(r["player"])) for _, r in log.iterrows())
+    results = grade_log_rows(key)
+    tops = log[log["is_top"].astype(str) == "1"]
+    s_all, s_top = clv.summary(log, results), clv.summary(tops, results)
+
+    def fmt_pct(x, nd=1, mult=100):
+        return "NA" if x is None or pd.isna(x) else f"{x * mult:.{nd}f}%"
+
+    c1, c2 = st.columns(2)
+    c1.metric("Top picks: avg CLV", "NA" if s_top["avg_pts"] is None else f"{s_top['avg_pts']:+.1f} pts",
+              f"{s_top['n']} with a last pregame price · beat close {fmt_pct(s_top['beat_close'], 0)}", delta_color="off")
+    px = "NA" if s_all["avg_price_pct"] is None or pd.isna(s_all["avg_price_pct"]) else f"{s_all['avg_price_pct']:+.1f}%"
+    c2.metric("All candidates: avg CLV", "NA" if s_all["avg_pts"] is None else f"{s_all['avg_pts']:+.1f} pts",
+              f"{s_all['n']} bets · price CLV {px}", delta_color="off")
+    by_sign = "".join(
+        f"<tr><td>{b['group']}</td><td>{b['bets']}</td><td>{b['graded']}</td>"
+        f"<td><b>{fmt_pct(b['hit_rate'], 0)}</b></td></tr>" for b in s_all["by_sign"])
+    if by_sign:
+        st_html(f"""
+        <div class='card'><div class='tbl-wrap'><table class='tbl'>
+          <tr><th>All candidates</th><th>Bets</th><th>Graded</th><th>Hit rate</th></tr>{by_sign}
+        </table></div></div>
+        """)
+    rows = ""
+    for _, r in log.sort_values(["date", "is_top"], ascending=[False, False]).head(40).iterrows():
+        res = results.get((str(r["date"]), str(r["pick"])))
+        icon = STATUS_ICON.get(res, "❔") if res else "❔"
+        top = " 🎯" if str(r["is_top"]) == "1" else ""
+        close = fmt_odds(int(float(r["close_odds"]))) if str(r["close_odds"]) not in ("", "nan") else "NA"
+        pick_px = fmt_odds(int(float(r["odds"]))) if str(r["odds"]) not in ("", "nan") else "NA"
+        imp_p = f"{float(r['imp'])*100:.0f}%" if str(r["imp"]) not in ("", "nan") else "NA"
+        imp_c = f"{float(r['close_imp'])*100:.0f}%" if str(r["close_imp"]) not in ("", "nan") else "NA"
+        rows += (f"<tr><td>{icon} <b>{r['pick']}</b>{top}<br><span class='card-sub'>{str(r['date'])[5:]} · "
+                 f"picked {r['saved_at']} · model {float(r['p'])*100:.0f}%</span></td>"
+                 f"<td>{pick_px} → {close}</td><td>{imp_p} → {imp_c}</td>"
+                 f"<td>{_clv_cell(r['clv_pts'])}<br><span class='card-sub'>{_clv_cell(r['clv_price_pct'], '%')}</span></td></tr>")
+    with st.expander(f"CLV log ({len(log)} bets, 🎯 = top pick)"):
+        st_html(f"""
+        <div class='card'><div class='tbl-wrap'><table class='tbl'>
+          <tr><th>Pick</th><th>Price → last</th><th>No-vig → last</th><th>CLV pts / price</th></tr>{rows}
+        </table></div></div>
+        """)
+    st.caption("CLV = DraftKings' last pregame no-vig chance minus the no-vig chance when the pick was saved "
+               "(positive = the market moved toward us). Price CLV = the return you'd expect if the last pregame "
+               "price is fair. The last price is the last one the site fetched (hourly, and only while someone has "
+               "the site open), so it can be a few hours before puck drop. NA = no saved feed price or the line moved. "
+               "A few dozen bets say very little: CLV and hit rates swing a lot until there are a few hundred.")
+    st.divider()
+
+
 with tab_rec:
     top_pick_record_section(est_now.date())
+    clv_record_section(est_now.date())
     best_bets_record_section(est_now.date())
 
     # -- Daily top-50 player review ---------------------------------------

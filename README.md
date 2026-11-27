@@ -27,11 +27,17 @@ Each pick is compared with the DraftKings price: line, odds, implied % and edge.
 - **The Odds API (optional):** add `ODDS_API_KEY = "..."` in the app's Streamlit Cloud settings under **Secrets**, and DraftKings lines load automatically.
 - **Manual:** type a line and odds in **Bets › Edit lines & odds**. These edits last only for your browser session.
 
+## Backtest and CLV
+
+- `backtests/` rebuilds past seasons game by game from data available that morning and scores the simulation. See `backtests/README.md` to rerun it (Actions tab › Backtest › Run workflow) and `backtests/results/README.md` for the latest results.
+- The Record tab's **Closing line value** section compares each night's top pick and Best bets candidates with DraftKings' last pregame price. The logs live on the `picks-data` branch: `picks/candidates/DATE.csv` (pick-time snapshot) and `picks/clv_log.csv` (append-only).
+- Tests: `pip install numpy pandas requests pytest streamlit`, then `python -m pytest tests`.
+
 ## Notebook
 
 Open the notebook in Google Colab and run the cells, or run it locally in Jupyter after `pip install -r requirements.txt`.
 
-If you change the model in the notebook, make the same change in `app.py`. The two are separate copies of the logic.
+If you change the model in the notebook, make the same change in `model_core.py` (the model math the site and the backtest share). The two are separate copies of the logic.
 
 ## Syncing from Colab
 
